@@ -4,12 +4,11 @@ import * as vscode from 'vscode';
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
 let eventQueue: any[] = [];
-let sessionTimer: NodeJS.Timeout | null = null;
+let errorDebounceTimer: NodeJS.Timeout | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
 	vscode.window.showInformationMessage('Codeography is running!');
 	
-	// Start session
 	startSession();
 
 	// Track file saves
@@ -32,13 +31,32 @@ export function activate(context: vscode.ExtensionContext) {
 		});
 	});
 
-	context.subscriptions.push(onSave, onOpen);
+	// Track errors — debounced 2 seconds
+	const onDiagnosticsChange = vscode.languages.onDidChangeDiagnostics((e) => {
+		if (errorDebounceTimer) {
+			clearTimeout(errorDebounceTimer);
+		}
+		errorDebounceTimer = setTimeout(() => {
+			e.uris.forEach((uri) => {
+				const diagnostics = vscode.languages.getDiagnostics(uri);
+				const errors = diagnostics.filter(
+					d => d.severity === vscode.DiagnosticSeverity.Error
+				);
+				trackEvent({
+					type: 'error_count_changed',
+					fileName: uri.path.split('/').pop(),
+					errorCount: errors.length,
+					timestamp: new Date().toISOString()
+				});
+			});
+		}, 2000);
+	});
+
+	context.subscriptions.push(onSave, onOpen, onDiagnosticsChange);
 }
 
 function startSession() {
 	sessionStart = new Date();
-	
-	// Get project name from workspace
 	const workspaceFolders = vscode.workspace.workspaceFolders;
 	activeProject = workspaceFolders 
 		? workspaceFolders[0].name 
@@ -59,7 +77,6 @@ function trackEvent(event: object) {
 }
 
 export function deactivate() {
-	// Track session end
 	trackEvent({
 		type: 'session_ended',
 		project: activeProject,
@@ -69,6 +86,5 @@ export function deactivate() {
 			? Math.round((Date.now() - sessionStart.getTime()) / 60000)
 			: 0
 	});
-
 	console.log('Session ended. Total events:', eventQueue.length);
 }
