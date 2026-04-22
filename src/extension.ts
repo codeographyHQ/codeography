@@ -4,12 +4,12 @@ import * as vscode from 'vscode';
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
 let eventQueue: any[] = [];
+let sessionTimer: NodeJS.Timeout | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
 	vscode.window.showInformationMessage('Codeography is running!');
-	console.log('Codeography is now active');
-
-	// Start session when extension activates
+	
+	// Start session
 	startSession();
 
 	// Track file saves
@@ -37,7 +37,19 @@ export function activate(context: vscode.ExtensionContext) {
 
 function startSession() {
 	sessionStart = new Date();
-	activeProject = vscode.workspace.name || 'unknown';
+	
+	// Get project name from workspace
+	const workspaceFolders = vscode.workspace.workspaceFolders;
+	activeProject = workspaceFolders 
+		? workspaceFolders[0].name 
+		: 'unknown';
+
+	trackEvent({
+		type: 'session_started',
+		project: activeProject,
+		timestamp: sessionStart.toISOString()
+	});
+
 	console.log(`Session started: ${activeProject}`);
 }
 
@@ -47,5 +59,16 @@ function trackEvent(event: object) {
 }
 
 export function deactivate() {
-	console.log('Session ended. Events captured:', eventQueue.length);
+	// Track session end
+	trackEvent({
+		type: 'session_ended',
+		project: activeProject,
+		timestamp: new Date().toISOString(),
+		totalEvents: eventQueue.length,
+		durationMinutes: sessionStart 
+			? Math.round((Date.now() - sessionStart.getTime()) / 60000)
+			: 0
+	});
+
+	console.log('Session ended. Total events:', eventQueue.length);
 }
