@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 
-// Session state
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
 let eventQueue: any[] = [];
@@ -8,10 +7,8 @@ let errorDebounceTimer: NodeJS.Timeout | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
 	vscode.window.showInformationMessage('Codeography is running!');
-	
 	startSession();
 
-	// Track file saves
 	const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
 		trackEvent({
 			type: 'file_saved',
@@ -21,7 +18,6 @@ export function activate(context: vscode.ExtensionContext) {
 		});
 	});
 
-	// Track file opens
 	const onOpen = vscode.workspace.onDidOpenTextDocument((doc) => {
 		trackEvent({
 			type: 'file_opened',
@@ -31,11 +27,8 @@ export function activate(context: vscode.ExtensionContext) {
 		});
 	});
 
-	// Track errors — debounced 2 seconds
 	const onDiagnosticsChange = vscode.languages.onDidChangeDiagnostics((e) => {
-		if (errorDebounceTimer) {
-			clearTimeout(errorDebounceTimer);
-		}
+		if (errorDebounceTimer) clearTimeout(errorDebounceTimer);
 		errorDebounceTimer = setTimeout(() => {
 			e.uris.forEach((uri) => {
 				const diagnostics = vscode.languages.getDiagnostics(uri);
@@ -52,22 +45,27 @@ export function activate(context: vscode.ExtensionContext) {
 		}, 2000);
 	});
 
-	context.subscriptions.push(onSave, onOpen, onDiagnosticsChange);
+	const gitWatcher = vscode.workspace.createFileSystemWatcher('**/.git/COMMIT_EDITMSG');
+	gitWatcher.onDidChange(() => {
+		trackEvent({
+			type: 'git_commit_created',
+			project: activeProject,
+			timestamp: new Date().toISOString()
+		});
+	});
+
+	context.subscriptions.push(onSave, onOpen, onDiagnosticsChange, gitWatcher);
 }
 
 function startSession() {
 	sessionStart = new Date();
 	const workspaceFolders = vscode.workspace.workspaceFolders;
-	activeProject = workspaceFolders 
-		? workspaceFolders[0].name 
-		: 'unknown';
-
+	activeProject = workspaceFolders ? workspaceFolders[0].name : 'unknown';
 	trackEvent({
 		type: 'session_started',
 		project: activeProject,
 		timestamp: sessionStart.toISOString()
 	});
-
 	console.log(`Session started: ${activeProject}`);
 }
 
@@ -82,7 +80,7 @@ export function deactivate() {
 		project: activeProject,
 		timestamp: new Date().toISOString(),
 		totalEvents: eventQueue.length,
-		durationMinutes: sessionStart 
+		durationMinutes: sessionStart
 			? Math.round((Date.now() - sessionStart.getTime()) / 60000)
 			: 0
 	});
