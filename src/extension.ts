@@ -1,12 +1,20 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
 let eventQueue: any[] = [];
 let errorDebounceTimer: NodeJS.Timeout | null = null;
+let storageDir: string | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
-	vscode.window.showInformationMessage('Codeography is running!');
+	// Set up storage directory
+	storageDir = context.globalStorageUri.fsPath;
+	if (!fs.existsSync(storageDir)) {
+		fs.mkdirSync(storageDir, { recursive: true });
+	}
+
 	startSession();
 
 	const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
@@ -72,6 +80,19 @@ function startSession() {
 function trackEvent(event: object) {
 	eventQueue.push(event);
 	console.log('Event tracked:', event);
+	persistEvents();
+}
+
+function persistEvents() {
+	if (!storageDir || !activeProject) return;
+
+	try {
+		const fileName = `${activeProject}-${new Date().toISOString().split('T')[0]}.json`;
+		const filePath = path.join(storageDir, fileName);
+		fs.writeFileSync(filePath, JSON.stringify(eventQueue, null, 2));
+	} catch (error) {
+		console.error('Failed to persist events:', error);
+	}
 }
 
 export function deactivate() {
