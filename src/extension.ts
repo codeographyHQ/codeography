@@ -7,6 +7,7 @@ let activeProject: string | null = null;
 let eventQueue: any[] = [];
 let errorDebounceTimer: NodeJS.Timeout | null = null;
 let storageDir: string | null = null;
+let statusBar: vscode.StatusBarItem | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
 	// Set up storage directory
@@ -14,6 +15,20 @@ export function activate(context: vscode.ExtensionContext) {
 	if (!fs.existsSync(storageDir)) {
 		fs.mkdirSync(storageDir, { recursive: true });
 	}
+
+	// Create status bar item
+	// Left alignment, priority 100 keeps it visible but not intrusive
+	statusBar = vscode.window.createStatusBarItem(
+		vscode.StatusBarAlignment.Left,
+		100
+	);
+	statusBar.text = '$(circle-filled) Codeography';
+	statusBar.tooltip = 'Codeography is recording your session';
+	statusBar.backgroundColor = new vscode.ThemeColor(
+		'statusBarItem.warningBackground'
+	);
+	statusBar.show();
+	context.subscriptions.push(statusBar);
 
 	startSession();
 
@@ -53,7 +68,9 @@ export function activate(context: vscode.ExtensionContext) {
 		}, 2000);
 	});
 
-	const gitWatcher = vscode.workspace.createFileSystemWatcher('**/.git/COMMIT_EDITMSG');
+	const gitWatcher = vscode.workspace.createFileSystemWatcher(
+		'**/.git/COMMIT_EDITMSG'
+	);
 	gitWatcher.onDidChange(() => {
 		trackEvent({
 			type: 'git_commit_created',
@@ -96,6 +113,11 @@ function persistEvents() {
 }
 
 export function deactivate() {
+	if (statusBar) {
+		statusBar.text = '$(circle-outline) Codeography';
+		statusBar.tooltip = 'Codeography session ended';
+	}
+
 	trackEvent({
 		type: 'session_ended',
 		project: activeProject,
@@ -105,5 +127,6 @@ export function deactivate() {
 			? Math.round((Date.now() - sessionStart.getTime()) / 60000)
 			: 0
 	});
+
 	console.log('Session ended. Total events:', eventQueue.length);
 }
