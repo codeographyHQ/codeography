@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
-const API_URL = 'http://localhost:8788';
+const API_URL = 'https://codeography-api.codeography.workers.dev';
 const SYNC_INTERVAL_MS = 60 * 1000; // 1 minute for testing
 
 let sessionStart: Date | null = null;
