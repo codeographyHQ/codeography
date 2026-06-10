@@ -2,22 +2,23 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
+const API_URL = 'http://localhost:8788';
+const SYNC_INTERVAL_MS = 60 * 1000; // 1 minute for testing
+
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
 let eventQueue: any[] = [];
 let errorDebounceTimer: NodeJS.Timeout | null = null;
+let syncTimer: NodeJS.Timeout | null = null;
 let storageDir: string | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
-	// Set up storage directory
 	storageDir = context.globalStorageUri.fsPath;
 	if (!fs.existsSync(storageDir)) {
 		fs.mkdirSync(storageDir, { recursive: true });
 	}
 
-	// Create status bar item
-	// Left alignment, priority 100 keeps it visible but not intrusive
 	statusBar = vscode.window.createStatusBarItem(
 		vscode.StatusBarAlignment.Left,
 		100
@@ -31,6 +32,11 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(statusBar);
 
 	startSession();
+
+	// Sync events to backend every 5 minutes
+	syncTimer = setInterval(() => {
+		syncEvents();
+	}, SYNC_INTERVAL_MS);
 
 	const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
 		trackEvent({
@@ -102,7 +108,6 @@ function trackEvent(event: object) {
 
 function persistEvents() {
 	if (!storageDir || !activeProject) return;
-
 	try {
 		const fileName = `${activeProject}-${new Date().toISOString().split('T')[0]}.json`;
 		const filePath = path.join(storageDir, fileName);
@@ -112,7 +117,40 @@ function persistEvents() {
 	}
 }
 
+async function syncEvents() {
+	if (eventQueue.length === 0 || !activeProject) return;
+
+	try {
+		const response = await fetch(`${API_URL}/api/sessions`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				project: activeProject,
+				events: eventQueue,
+				startedAt: sessionStart?.toISOString(),
+				durationMinutes: sessionStart
+					? Math.round((Date.now() - sessionStart.getTime()) / 60000)
+					: 0
+			})
+		});
+
+		if (response.ok) {
+			console.log(`Synced ${eventQueue.length} events to backend`);
+		} else {
+			console.error('Sync failed:', response.status);
+		}
+	} catch (error) {
+		// Silent fail — events are still saved locally
+		console.error('Sync error:', error);
+	}
+}
+
 export function deactivate() {
+	if (syncTimer) clearInterval(syncTimer);
+
+	// Final sync on deactivate
+	syncEvents();
+
 	if (statusBar) {
 		statusBar.text = '$(circle-outline) Codeography';
 		statusBar.tooltip = 'Codeography session ended';
