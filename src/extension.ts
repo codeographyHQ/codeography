@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
-const SYNC_INTERVAL_MS = 60 * 1000; // 1 minute for testing
+const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
