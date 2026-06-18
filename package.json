@@ -14,8 +14,8 @@
   "contributes": {
     "commands": [
       {
-        "command": "codeography.helloWorld",
-        "title": "Hello World"
+        "command": "codeography.setApiKey",
+        "title": "Codeography: Set API Key"
       }
     ]
   },

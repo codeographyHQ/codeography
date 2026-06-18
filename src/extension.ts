@@ -4,6 +4,7 @@ import * as path from 'path';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const SECRET_KEY = 'codeography.apiKey';
 
 let sessionStart: Date | null = null;
 let activeProject: string | null = null;
@@ -12,9 +13,12 @@ let errorDebounceTimer: NodeJS.Timeout | null = null;
 let syncTimer: NodeJS.Timeout | null = null;
 let storageDir: string | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
+let secretStorage: vscode.SecretStorage | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
 	storageDir = context.globalStorageUri.fsPath;
+	secretStorage = context.secrets;
+
 	if (!fs.existsSync(storageDir)) {
 		fs.mkdirSync(storageDir, { recursive: true });
 	}
@@ -31,9 +35,25 @@ export function activate(context: vscode.ExtensionContext) {
 	statusBar.show();
 	context.subscriptions.push(statusBar);
 
+	// Command: Set API Key
+	const setKeyCommand = vscode.commands.registerCommand(
+		'codeography.setApiKey',
+		async () => {
+			const key = await vscode.window.showInputBox({
+				prompt: 'Paste your Codeography API key (from codeography.dev/dashboard)',
+				password: true,
+				placeHolder: 'cdg_live_...',
+			});
+			if (key && secretStorage) {
+				await secretStorage.store(SECRET_KEY, key.trim());
+				vscode.window.showInformationMessage('Codeography: API key saved.');
+			}
+		}
+	);
+	context.subscriptions.push(setKeyCommand);
+
 	startSession();
 
-	// Sync events to backend every 5 minutes
 	syncTimer = setInterval(() => {
 		syncEvents();
 	}, SYNC_INTERVAL_MS);
@@ -118,12 +138,26 @@ function persistEvents() {
 }
 
 async function syncEvents() {
+	if (!API_URL.startsWith('https://')) {
+		console.error('Codeography: API_URL must use HTTPS. Aborting sync.')
+		return
+	}
 	if (eventQueue.length === 0 || !activeProject) return;
+	if (!secretStorage) return;
+
+	const apiKey = await secretStorage.get(SECRET_KEY);
+	if (!apiKey) {
+		console.warn('Codeography: No API key set. Run "Codeography: Set API Key" first.');
+		return;
+	}
 
 	try {
 		const response = await fetch(`${API_URL}/api/sessions`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${apiKey}`,
+			},
 			body: JSON.stringify({
 				project: activeProject,
 				events: eventQueue,
@@ -136,6 +170,8 @@ async function syncEvents() {
 
 		if (response.ok) {
 			console.log(`Synced ${eventQueue.length} events to backend`);
+		} else if (response.status === 401) {
+			console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
 		} else {
 			console.error('Sync failed:', response.status);
 		}
@@ -148,7 +184,6 @@ async function syncEvents() {
 export function deactivate() {
 	if (syncTimer) clearInterval(syncTimer);
 
-	// Final sync on deactivate
 	syncEvents();
 
 	if (statusBar) {
