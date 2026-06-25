@@ -11,6 +11,10 @@ let activeProject: string | null = null;
 let eventQueue: any[] = [];
 let errorDebounceTimer: NodeJS.Timeout | null = null;
 let syncTimer: NodeJS.Timeout | null = null;
+let peakErrors = 0;
+let totalErrorsFixed = 0;
+let errorsEverAppeared = false;
+let lastErrorCount = 0;
 let storageDir: string | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
 let secretStorage: vscode.SecretStorage | null = null;
@@ -78,20 +82,29 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const onDiagnosticsChange = vscode.languages.onDidChangeDiagnostics((e) => {
 		if (errorDebounceTimer) clearTimeout(errorDebounceTimer);
+		// Short debounce so even brief errors that are quickly fixed get captured
 		errorDebounceTimer = setTimeout(() => {
-			e.uris.forEach((uri) => {
-				const diagnostics = vscode.languages.getDiagnostics(uri);
-				const errors = diagnostics.filter(
-					d => d.severity === vscode.DiagnosticSeverity.Error
-				);
-				trackEvent({
-					type: 'error_count_changed',
-					fileName: uri.path.split('/').pop(),
-					errorCount: errors.length,
-					timestamp: new Date().toISOString()
-				});
+			// Count total errors across ALL open files, not just changed ones
+			let totalErrors = 0;
+			vscode.languages.getDiagnostics().forEach(([, diags]) => {
+				totalErrors += diags.filter(d => d.severity === vscode.DiagnosticSeverity.Error).length;
 			});
-		}, 2000);
+
+			// Track the session-wide error arc
+			if (totalErrors > peakErrors) peakErrors = totalErrors;
+			if (totalErrors > 0) errorsEverAppeared = true;
+			// If error count dropped, the developer fixed that many errors
+			if (totalErrors < lastErrorCount) {
+				totalErrorsFixed += (lastErrorCount - totalErrors);
+			}
+			lastErrorCount = totalErrors;
+
+			trackEvent({
+				type: 'error_count_changed',
+				errorCount: totalErrors,
+				timestamp: new Date().toISOString()
+			});
+		}, 300);
 	});
 
 	const gitWatcher = vscode.workspace.createFileSystemWatcher(
@@ -164,7 +177,13 @@ async function syncEvents() {
 				startedAt: sessionStart?.toISOString(),
 				durationMinutes: sessionStart
 					? Math.round((Date.now() - sessionStart.getTime()) / 60000)
-					: 0
+					: 0,
+				errorSummary: {
+					peakErrors,
+					totalErrorsFixed,
+					errorsEverAppeared,
+					resolved: errorsEverAppeared && lastErrorCount === 0
+				}
 			})
 		});
 
@@ -175,6 +194,11 @@ async function syncEvents() {
 			persistEvents();
 			// Reset the session clock so each session measures its own window
 			sessionStart = new Date();
+			// Reset error trackers so each session measures its own error arc
+			peakErrors = 0;
+			totalErrorsFixed = 0;
+			errorsEverAppeared = false;
+			lastErrorCount = 0;
 		} else if (response.status === 401) {
 			console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
 		} else {
