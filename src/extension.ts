@@ -170,6 +170,11 @@ async function syncEvents() {
 
 		if (response.ok) {
 			console.log(`Synced ${eventQueue.length} events to backend`);
+			// Clear the queue after a successful sync so we don't re-send
+			eventQueue = [];
+			persistEvents();
+			// Reset the session clock so each session measures its own window
+			sessionStart = new Date();
 		} else if (response.status === 401) {
 			console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
 		} else {
