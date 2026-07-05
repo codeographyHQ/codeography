@@ -4,9 +4,12 @@ import * as path from 'path';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const IDLE_GAP_MS = 15 * 60 * 1000; // 15 min of no activity ends a session
 const SECRET_KEY = 'codeography.apiKey';
 
 let sessionStart: Date | null = null;
+let clientSessionId: string | null = null;
+let lastActivityAt: number = Date.now();
 let activeProject: string | null = null;
 let eventQueue: any[] = [];
 let errorDebounceTimer: NodeJS.Timeout | null = null;
@@ -123,6 +126,8 @@ export function activate(context: vscode.ExtensionContext) {
 
 function startSession() {
 	sessionStart = new Date();
+	clientSessionId = (globalThis.crypto?.randomUUID?.() ?? `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+	lastActivityAt = Date.now();
 	const workspaceFolders = vscode.workspace.workspaceFolders;
 	activeProject = workspaceFolders ? workspaceFolders[0].name : 'unknown';
 	trackEvent({
@@ -130,10 +135,17 @@ function startSession() {
 		project: activeProject,
 		timestamp: sessionStart.toISOString()
 	});
-	console.log(`Session started: ${activeProject}`);
+	console.log(`Session started: ${activeProject} (${clientSessionId})`);
 }
 
 function trackEvent(event: object) {
+	const now = Date.now();
+	if (sessionStart && (now - lastActivityAt) > IDLE_GAP_MS) {
+		console.log('Idle gap detected — finalizing previous session.');
+		void syncEvents(true);
+		startSession();
+	}
+	lastActivityAt = now;
 	eventQueue.push(event);
 	console.log('Event tracked:', event);
 	persistEvents();
@@ -150,7 +162,7 @@ function persistEvents() {
 	}
 }
 
-async function syncEvents() {
+async function syncEvents(finalize: boolean = false) {
 	if (!API_URL.startsWith('https://')) {
 		console.error('Codeography: API_URL must use HTTPS. Aborting sync.')
 		return
@@ -173,6 +185,8 @@ async function syncEvents() {
 			},
 			body: JSON.stringify({
 				project: activeProject,
+				clientSessionId: clientSessionId,
+				finalize: finalize,
 				events: eventQueue,
 				startedAt: sessionStart?.toISOString(),
 				durationMinutes: sessionStart
@@ -192,13 +206,18 @@ async function syncEvents() {
 			// Clear the queue after a successful sync so we don't re-send
 			eventQueue = [];
 			persistEvents();
-			// Reset the session clock so each session measures its own window
-			sessionStart = new Date();
-			// Reset error trackers so each session measures its own error arc
-			peakErrors = 0;
-			totalErrorsFixed = 0;
-			errorsEverAppeared = false;
-			lastErrorCount = 0;
+			// Do NOT reset sessionStart here — the session clock keeps running
+			// across syncs so duration measures the whole session. Error trackers
+			// also persist across the session and only reset on a fresh startSession().
+			if (finalize) {
+				// Session ended: clear session state so the next activity starts clean
+				sessionStart = null;
+				clientSessionId = null;
+				peakErrors = 0;
+				totalErrorsFixed = 0;
+				errorsEverAppeared = false;
+				lastErrorCount = 0;
+			}
 		} else if (response.status === 401) {
 			console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
 		} else {
@@ -213,7 +232,8 @@ async function syncEvents() {
 export function deactivate() {
 	if (syncTimer) clearInterval(syncTimer);
 
-	syncEvents();
+	// VS Code closing = session ended → finalize (generates the narrative)
+	syncEvents(true);
 
 	if (statusBar) {
 		statusBar.text = '$(circle-outline) Codeography';
