@@ -5,6 +5,7 @@ import * as path from 'path';
 const API_URL = 'https://codeography-api.codeography.workers.dev';
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDLE_GAP_MS = 15 * 60 * 1000; // 15 min of no activity ends a session
+const MIN_SESSION_EVENTS = 5; // sessions with fewer real events aren't worth narrating
 const SECRET_KEY = 'codeography.apiKey';
 
 let sessionStart: Date | null = null;
@@ -169,6 +170,22 @@ async function syncEvents(finalize: boolean = false) {
 	}
 	if (eventQueue.length === 0 || !activeProject) return;
 	if (!secretStorage) return;
+
+	// Substance gate: on finalize, a session with too few events is
+	// trivial background noise, not real work. Discard it instead of
+	// sending junk to the backend.
+	if (finalize && eventQueue.length < MIN_SESSION_EVENTS) {
+		console.log(`Codeography: discarding trivial session (${eventQueue.length} events).`);
+		eventQueue = [];
+		persistEvents();
+		sessionStart = null;
+		clientSessionId = null;
+		peakErrors = 0;
+		totalErrorsFixed = 0;
+		errorsEverAppeared = false;
+		lastErrorCount = 0;
+		return;
+	}
 
 	const apiKey = await secretStorage.get(SECRET_KEY);
 	if (!apiKey) {
