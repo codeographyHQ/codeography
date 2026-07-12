@@ -246,17 +246,19 @@ async function syncEvents(finalize: boolean = false) {
 	}
 }
 
-export function deactivate() {
+// VS Code waits for a Promise returned from deactivate() before killing the
+// extension host. Returning the finalize promise (instead of firing and
+// forgetting) is what lets the session actually finalize on a clean close —
+// so the user's story appears in seconds, not minutes.
+export async function deactivate() {
 	if (syncTimer) clearInterval(syncTimer);
-
-	// VS Code closing = session ended → finalize (generates the narrative)
-	syncEvents(true);
 
 	if (statusBar) {
 		statusBar.text = '$(circle-outline) Codeography';
 		statusBar.tooltip = 'Codeography session ended';
 	}
 
+	// Record the session_ended event BEFORE syncing, so it actually gets sent.
 	trackEvent({
 		type: 'session_ended',
 		project: activeProject,
@@ -268,4 +270,12 @@ export function deactivate() {
 	});
 
 	console.log('Session ended. Total events:', eventQueue.length);
+
+	// Finalize the session. Await it so VS Code waits for the network call,
+	// but cap the wait so a slow/offline network can never hang shutdown.
+	// If this doesn't land, the backend cron sweep finalizes it anyway.
+	await Promise.race([
+		syncEvents(true),
+		new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+	]);
 }
