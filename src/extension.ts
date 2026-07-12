@@ -21,6 +21,38 @@ let errorsEverAppeared = false;
 let lastErrorCount = 0;
 let storageDir: string | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
+let lastSyncFailed = false;
+
+// The status bar must tell the truth about state — not just that the
+// extension exists. A missing/invalid key looks identical to a working
+// setup otherwise, and the user has no way to know nothing is syncing.
+async function refreshStatusBar() {
+	if (!statusBar) return;
+
+	const key = secretStorage ? await secretStorage.get(SECRET_KEY) : undefined;
+	const warn = new vscode.ThemeColor('statusBarItem.warningBackground');
+
+	if (!key) {
+		statusBar.text = '$(warning) Codeography · set API key';
+		statusBar.tooltip = 'Codeography needs an API key. Click to set it.';
+		statusBar.backgroundColor = warn;
+		return;
+	}
+
+	if (lastSyncFailed) {
+		statusBar.text = '$(warning) Codeography · sync failed';
+		statusBar.tooltip = 'Codeography could not sync. Check your API key.';
+		statusBar.backgroundColor = warn;
+		return;
+	}
+
+	const count = eventQueue.length;
+	statusBar.text = count > 0
+		? `$(circle-filled) Codeography · ${count} events`
+		: '$(circle-filled) Codeography';
+	statusBar.tooltip = 'Codeography is recording your session';
+	statusBar.backgroundColor = undefined;
+}
 let secretStorage: vscode.SecretStorage | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
@@ -35,13 +67,13 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.StatusBarAlignment.Left,
 		100
 	);
-	statusBar.text = '$(circle-filled) Codeography';
-	statusBar.tooltip = 'Codeography is recording your session';
-	statusBar.backgroundColor = new vscode.ThemeColor(
-		'statusBarItem.warningBackground'
-	);
+	statusBar.command = 'codeography.setApiKey';
 	statusBar.show();
 	context.subscriptions.push(statusBar);
+
+	// Reflect the REAL state: a user with a dead key must never see a
+	// confident "recording" light while nothing is actually syncing.
+	void refreshStatusBar();
 
 	// Command: Set API Key
 	const setKeyCommand = vscode.commands.registerCommand(
@@ -54,6 +86,8 @@ export function activate(context: vscode.ExtensionContext) {
 			});
 			if (key && secretStorage) {
 				await secretStorage.store(SECRET_KEY, key.trim());
+				lastSyncFailed = false;
+				void refreshStatusBar();
 				vscode.window.showInformationMessage('Codeography: API key saved.');
 			}
 		}
@@ -148,6 +182,7 @@ function trackEvent(event: object) {
 	}
 	lastActivityAt = now;
 	eventQueue.push(event);
+	void refreshStatusBar();
 	console.log('Event tracked:', event);
 	persistEvents();
 }
@@ -219,6 +254,8 @@ async function syncEvents(finalize: boolean = false) {
 		});
 
 		if (response.ok) {
+			lastSyncFailed = false;
+			void refreshStatusBar();
 			console.log(`Synced ${eventQueue.length} events to backend`);
 			// Clear the queue after a successful sync so we don't re-send
 			eventQueue = [];
@@ -236,6 +273,8 @@ async function syncEvents(finalize: boolean = false) {
 				lastErrorCount = 0;
 			}
 		} else if (response.status === 401) {
+			lastSyncFailed = true;
+			void refreshStatusBar();
 			console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
 		} else {
 			console.error('Sync failed:', response.status);
