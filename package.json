@@ -1,15 +1,19 @@
 {
   "name": "codeography",
-  "displayName": "codeography",
-  "description": "Your code, documented like a story",
-  "version": "0.0.1",
+  "displayName": "Codeography",
+  "description": "Turn your coding sessions into cinematic, narrative-driven stories. You code. Codeography tells the story.",
+  "version": "0.1.1",
   "engines": {
     "vscode": "^1.115.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Visualization",
+    "SCM Providers"
   ],
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -36,5 +40,29 @@
     "typescript": "^5.9.3",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2"
+  },
+  "publisher": "codeographyHQ",
+  "keywords": [
+    "portfolio",
+    "proof of work",
+    "coding stats",
+    "developer story",
+    "productivity",
+    "git",
+    "narrative"
+  ],
+  "icon": "icon.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codeographyHQ/codeography"
+  },
+  "bugs": {
+    "url": "https://github.com/codeographyHQ/codeography/issues"
+  },
+  "homepage": "https://codeography.dev",
+  "galleryBanner": {
+    "color": "#0C0B0A",
+    "theme": "dark"
   }
 }
