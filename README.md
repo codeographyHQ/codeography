@@ -51,6 +51,21 @@ Every finalized session becomes a cinematic story on your public profile — a l
 |---|---|
 | `Codeography: Set API Key` | Links the extension to your account |
 
+## Running it locally
+git clone https://github.com/codeographyHQ/codeography.git
+cd codeography
+npm install
+
+Press F5 in VS Code to launch the Extension Development Host and try it.
+
+## Status
+
+Early and actively developed (v0.1.2). Built solo. Feedback and issues welcome.
+
+## License
+
+MIT - see LICENSE.txt.
+
 ---
 
 <div align="center">
