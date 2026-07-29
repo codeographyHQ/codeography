@@ -188,9 +188,9 @@ function trackEvent(event: object) {
 }
 
 function persistEvents() {
-	if (!storageDir || !activeProject) return;
+	if (!storageDir) return;
 	try {
-		const fileName = `${activeProject}-${new Date().toISOString().split('T')[0]}.json`;
+		const fileName = `codeography-${new Date().toISOString().split('T')[0]}.json`;
 		const filePath = path.join(storageDir, fileName);
 		fs.writeFileSync(filePath, JSON.stringify(eventQueue, null, 2));
 	} catch (error) {
