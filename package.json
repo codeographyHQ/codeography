@@ -2,7 +2,7 @@
   "name": "codeography",
   "displayName": "Codeography",
   "description": "Turn your coding sessions into cinematic, narrative-driven stories. You code. Codeography tells the story.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "engines": {
     "vscode": "^1.115.0"
   },
@@ -11,7 +11,8 @@
     "Visualization"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onUri"
   ],
   "main": "./out/extension.js",
   "contributes": {

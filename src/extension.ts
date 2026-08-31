@@ -94,6 +94,29 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 	context.subscriptions.push(setKeyCommand);
 
+	// URI handler: vscode://codeographyHQ.codeography/connect?key=<apiKey>
+	// Triggered by the "Connect to VS Code" button on codeography.dev/dashboard.
+	const uriHandler = vscode.window.registerUriHandler({
+		handleUri(uri: vscode.Uri) {
+			if (uri.path !== '/connect') return;
+			const key = new URLSearchParams(uri.query).get('key')?.trim();
+			// Basic sanity check — only accept something shaped like a real key.
+			// Prevents a malicious link from storing arbitrary junk in SecretStorage.
+			if (!key || !key.startsWith('cdg_live_') || key.length < 20) {
+				vscode.window.showErrorMessage('Codeography: Invalid connection link.');
+				return;
+			}
+			if (secretStorage) {
+				secretStorage.store(SECRET_KEY, key).then(() => {
+					lastSyncFailed = false;
+					void refreshStatusBar();
+					vscode.window.showInformationMessage('Codeography: Connected! Your session recording is now active.');
+				});
+			}
+		}
+	});
+	context.subscriptions.push(uriHandler);
+
 	startSession();
 
 	syncTimer = setInterval(() => {
