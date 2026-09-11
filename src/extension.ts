@@ -1,4 +1,50 @@
 import * as vscode from 'vscode';
+// test comment via vscode extension
+// vscode test 1
+// vscode test 2
+// vscode test 3
+// vscode test 4
+// vscode test 5
+// vscode test 6
+// vscode test 7
+// vscode test 8
+// vscode test 9
+// vscode test 10
+// vscode test 11
+// vscode test 12
+// vscode test 13
+// vscode test 14
+// vscode test 15
+// test comment for agent-tracking check
+// test comment 2
+// test comment 3
+// test comment 4
+// test comment 5
+// test comment 6
+// test comment 7
+// test comment 8
+// test comment 9
+// test comment 10
+// test comment 11
+// test comment 12
+// test comment 13
+// test comment 14
+// test comment 15
+// test comment 16
+// test comment 17
+// test comment 18
+// test comment 19
+// test comment 20
+// test comment 21
+// test comment 22
+// test comment 23
+// test comment 24
+// test comment 25
+// test comment 26 (added by codeography-2f)
+// test comment 27 (added by codeography-2f)
+// test comment 28
+// test comment 29
+// test comment 30
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -124,10 +170,37 @@ export function activate(context: vscode.ExtensionContext) {
 	}, SYNC_INTERVAL_MS);
 
 	const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
+		// Mark this file as just saved through VS Code's own save command,
+		// so the file-system watcher below doesn't double-count it as an
+		// external change a moment later.
+		recentVSCodeSaves.add(doc.uri.fsPath);
 		trackEvent({
 			type: 'file_saved',
 			fileName: doc.fileName.split('/').pop(),
 			language: doc.languageId,
+			timestamp: new Date().toISOString()
+		});
+	});
+
+	// Watches for file changes written directly to disk — catches AI
+	// coding agents (like the standalone Claude Code CLI) that write
+	// files without going through VS Code's own save command, which
+	// onDidSaveTextDocument alone would completely miss.
+	const fsWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+	const recentVSCodeSaves = new Set<string>();
+
+	fsWatcher.onDidChange((uri) => {
+		const key = uri.fsPath;
+		// If VS Code itself just saved this file, skip it — onDidSaveTextDocument
+		// already tracked it as a real file_saved event, so this is not a second,
+		// separate write.
+		if (recentVSCodeSaves.has(key)) {
+			recentVSCodeSaves.delete(key);
+			return;
+		}
+		trackEvent({
+			type: 'file_changed_externally',
+			fileName: key.split('/').pop(),
 			timestamp: new Date().toISOString()
 		});
 	});
@@ -341,3 +414,13 @@ export async function deactivate() {
 		new Promise<void>((resolve) => setTimeout(resolve, 3000)),
 	]);
 }
+
+// isolated test
+// isolated test
+// isolated test
+// isolated test
+// isolated test
+// isolated test
+// isolated test
+// isolated test
+// isolated test
