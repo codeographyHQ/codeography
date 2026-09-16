@@ -34,6 +34,8 @@ Codeography watches. Then it writes the story down.
 - File names and programming languages
 - Number of saves, errors, and git commits
 - Session duration and timing
+- File changes made outside VS Code's own save command, including
+  from AI coding agents that write directly to disk
 
 ## What it never does
 
@@ -65,7 +67,7 @@ Press `F5` in VS Code to launch the Extension Development Host and try it.
 
 ## Status
 
-Early and actively developed (`v0.1.3`). Built solo. Feedback and issues welcome.
+Early and actively developed (`v0.1.6`). Built solo. Feedback and issues welcome.
 
 ## License
 
