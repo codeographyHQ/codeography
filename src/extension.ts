@@ -211,7 +211,9 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		// Derive a language from the file extension since this event has
 		// no VS Code document object to read languageId from directly.
-		const ext = key.split('.').pop()?.toLowerCase();
+		const base = getBaseName(key);
+		const dot = base.lastIndexOf('.');
+		const ext = dot > 0 ? base.slice(dot + 1).toLowerCase() : undefined;
 		const extToLanguage: Record<string, string> = {
 			ts: 'typescript', tsx: 'typescriptreact', js: 'javascript', jsx: 'javascriptreact',
 			py: 'python', java: 'java', go: 'go', rs: 'rust', c: 'c', cpp: 'cpp', cs: 'csharp',
@@ -221,7 +223,7 @@ export function activate(context: vscode.ExtensionContext) {
 		trackEvent({
 			type: 'file_changed_externally',
 			fileName: getBaseName(key),
-			language: ext ? (extToLanguage[ext] ?? ext) : undefined,
+			language: (ext && extToLanguage[ext]) || 'plaintext',
 			timestamp: new Date().toISOString()
 		});
 	});
