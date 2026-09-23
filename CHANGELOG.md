@@ -2,6 +2,11 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
+## [0.1.11]
+
+- Documentation update only: the README now states that the project
+  folder name is sent, and that only file names are sent, never full paths
+
 ## [0.1.10]
 
 - Hardened language detection for files changed outside VS Code: the
