@@ -2,7 +2,7 @@
   "name": "codeography",
   "displayName": "Codeography",
   "description": "Turn your coding sessions into cinematic, narrative-driven stories. You code. Codeography tells the story.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "engines": {
     "vscode": "^1.115.0"
   },

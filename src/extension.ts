@@ -198,9 +198,19 @@ export function activate(context: vscode.ExtensionContext) {
 			recentVSCodeSaves.delete(key);
 			return;
 		}
+		// Derive a language from the file extension since this event has
+		// no VS Code document object to read languageId from directly.
+		const ext = key.split('.').pop()?.toLowerCase();
+		const extToLanguage: Record<string, string> = {
+			ts: 'typescript', tsx: 'typescriptreact', js: 'javascript', jsx: 'javascriptreact',
+			py: 'python', java: 'java', go: 'go', rs: 'rust', c: 'c', cpp: 'cpp', cs: 'csharp',
+			json: 'json', md: 'markdown', html: 'html', css: 'css', yml: 'yaml', yaml: 'yaml',
+			sql: 'sql', sh: 'shellscript', rb: 'ruby', php: 'php',
+		};
 		trackEvent({
 			type: 'file_changed_externally',
 			fileName: key.split('/').pop(),
+			language: ext ? (extToLanguage[ext] ?? ext) : undefined,
 			timestamp: new Date().toISOString()
 		});
 	});
@@ -424,3 +434,4 @@ export async function deactivate() {
 // isolated test
 // isolated test
 // isolated test
+// final marketplace test
