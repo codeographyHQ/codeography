@@ -101,6 +101,17 @@ async function refreshStatusBar() {
 }
 let secretStorage: vscode.SecretStorage | null = null;
 
+// Extracts just the filename from a full path, handling both
+// forward slashes (macOS/Linux) and backslashes (Windows).
+// Without this, Windows users had their full absolute path stored,
+// including parent folder and project names, e.g. a client's
+// business name in the directory structure. Only the base filename
+// should ever be sent, matching the privacy promise: the shape of
+// the work, never its contents or context.
+function getBaseName(fullPath: string): string {
+	return fullPath.split(/[\\/]/).pop() ?? fullPath;
+}
+
 export function activate(context: vscode.ExtensionContext) {
 	storageDir = context.globalStorageUri.fsPath;
 	secretStorage = context.secrets;
@@ -176,7 +187,7 @@ export function activate(context: vscode.ExtensionContext) {
 		recentVSCodeSaves.add(doc.uri.fsPath);
 		trackEvent({
 			type: 'file_saved',
-			fileName: doc.fileName.split('/').pop(),
+			fileName: getBaseName(doc.fileName),
 			language: doc.languageId,
 			timestamp: new Date().toISOString()
 		});
@@ -209,7 +220,7 @@ export function activate(context: vscode.ExtensionContext) {
 		};
 		trackEvent({
 			type: 'file_changed_externally',
-			fileName: key.split('/').pop(),
+			fileName: getBaseName(key),
 			language: ext ? (extToLanguage[ext] ?? ext) : undefined,
 			timestamp: new Date().toISOString()
 		});
@@ -218,7 +229,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const onOpen = vscode.workspace.onDidOpenTextDocument((doc) => {
 		trackEvent({
 			type: 'file_opened',
-			fileName: doc.fileName.split('/').pop(),
+			fileName: getBaseName(doc.fileName),
 			language: doc.languageId,
 			timestamp: new Date().toISOString()
 		});
