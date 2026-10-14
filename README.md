@@ -32,17 +32,25 @@ Codeography watches. Then it writes the story down.
 ## What it tracks
 
 - File names (only the name, never the full path) and programming languages
-- The name of your project folder
 - Number of saves, errors, and git commits
 - Session duration and timing
 - File changes made outside VS Code's own save command, including
-  from AI coding agents that write directly to disk
+  from AI coding agents that write directly to disk. These are recorded
+  separately and are never counted as your own saves.
+
+Events waiting to be sent are kept in VS Code's extension storage on your
+machine, so a crash or an offline shutdown does not lose them.
 
 ## What it never does
 
 - **Never reads your source code.** Only the shape of the session, never its contents.
 - **Never logs keystrokes, clipboard, or anything you type.**
 - **Never tracks you outside your editor.**
+- **Never sends your project folder name.**
+- **Never sends the names of secret files.** Activity in files such as `.env`,
+  `*.pem`, `*.key`, `id_rsa` or `credentials.json` is counted without the name.
+- **Never sends commit messages.** A short commit SHA is sent only if you turn on
+  the `codeography.includeCommitSha` setting.
 
 The extension is [open source](https://github.com/codeographyHQ/codeography). Read exactly what it does, don't take our word for it. Full [privacy policy](https://codeography.dev/privacy).
 
