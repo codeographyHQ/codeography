@@ -1,136 +1,189 @@
 import * as vscode from 'vscode';
-// test comment via vscode extension
-// vscode test 1
-// vscode test 2
-// vscode test 3
-// vscode test 4
-// vscode test 5
-// vscode test 6
-// vscode test 7
-// vscode test 8
-// vscode test 9
-// vscode test 10
-// vscode test 11
-// vscode test 12
-// vscode test 13
-// vscode test 14
-// vscode test 15
-// test comment for agent-tracking check
-// test comment 2
-// test comment 3
-// test comment 4
-// test comment 5
-// test comment 6
-// test comment 7
-// test comment 8
-// test comment 9
-// test comment 10
-// test comment 11
-// test comment 12
-// test comment 13
-// test comment 14
-// test comment 15
-// test comment 16
-// test comment 17
-// test comment 18
-// test comment 19
-// test comment 20
-// test comment 21
-// test comment 22
-// test comment 23
-// test comment 24
-// test comment 25
-// test comment 26 (added by codeography-2f)
-// test comment 27 (added by codeography-2f)
-// test comment 28
-// test comment 29
-// test comment 30
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
+import {
+	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
+	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
+	parseReflogCommit, readReflogSince,
+} from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const IDLE_GAP_MS = 15 * 60 * 1000; // 15 min of no activity ends a session
-const MIN_SESSION_EVENTS = 5; // sessions with fewer real events aren't worth narrating
+const REQUEST_TIMEOUT_MS = 15_000;
 const SECRET_KEY = 'codeography.apiKey';
+const STATE_PREFIX = 'state-';
 
-let sessionStart: Date | null = null;
-let clientSessionId: string | null = null;
-let lastActivityAt: number = Date.now();
-let activeProject: string | null = null;
-let eventQueue: any[] = [];
-let errorDebounceTimer: NodeJS.Timeout | null = null;
-let syncTimer: NodeJS.Timeout | null = null;
-let peakErrors = 0;
-let totalErrorsFixed = 0;
-let errorsEverAppeared = false;
-let lastErrorCount = 0;
-let storageDir: string | null = null;
+let recorder: Recorder | null = null;
+let secretStorage: vscode.SecretStorage | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
-let lastSyncFailed = false;
+let syncTimer: NodeJS.Timeout | null = null;
+let storageDir: string | null = null;
+let stateFile: string | null = null;
+let persistTimer: NodeJS.Timeout | null = null;
+let flushPendingWrites: (() => void) | null = null;
+// Cached so the status bar never needs a keychain read per event.
+let hasKey = false;
+let syncProblem: Extract<SyncResult, 'unauthorized' | 'rejected'> | null = null;
 
 // The status bar must tell the truth about state — not just that the
 // extension exists. A missing/invalid key looks identical to a working
 // setup otherwise, and the user has no way to know nothing is syncing.
-async function refreshStatusBar() {
-	if (!statusBar) return;
+function refreshStatusBar() {
+	if (!statusBar) {return;}
 
-	const key = secretStorage ? await secretStorage.get(SECRET_KEY) : undefined;
 	const warn = new vscode.ThemeColor('statusBarItem.warningBackground');
 
-	if (!key) {
+	if (!hasKey) {
 		statusBar.text = '$(warning) Codeography · set API key';
 		statusBar.tooltip = 'Codeography needs an API key. Click to set it.';
 		statusBar.backgroundColor = warn;
 		return;
 	}
 
-	if (lastSyncFailed) {
+	if (syncProblem === 'unauthorized') {
 		statusBar.text = '$(warning) Codeography · sync failed';
 		statusBar.tooltip = 'Codeography could not sync. Check your API key.';
 		statusBar.backgroundColor = warn;
 		return;
 	}
 
-	const count = eventQueue.length;
+	if (syncProblem === 'rejected') {
+		statusBar.text = '$(warning) Codeography · sync rejected';
+		statusBar.tooltip = 'The server rejected the upload. Your events are kept and will be retried; updating the extension may be needed.';
+		statusBar.backgroundColor = warn;
+		return;
+	}
+
+	const count = recorder?.state.queue.length ?? 0;
 	statusBar.text = count > 0
 		? `$(circle-filled) Codeography · ${count} events`
 		: '$(circle-filled) Codeography';
 	statusBar.tooltip = 'Codeography is recording your session';
 	statusBar.backgroundColor = undefined;
 }
-let secretStorage: vscode.SecretStorage | null = null;
 
-// Extracts just the filename from a full path, handling both
-// forward slashes (macOS/Linux) and backslashes (Windows).
-// Without this, Windows users had their full absolute path stored,
-// including parent folder and project names, e.g. a client's
-// business name in the directory structure. Only the base filename
-// should ever be sent, matching the privacy promise: the shape of
-// the work, never its contents or context.
-function getBaseName(fullPath: string): string {
-	return fullPath.split(/[\\/]/).pop() ?? fullPath;
+// ---------- persistence (one file per window, recovered after a crash) ----------
+
+function writeState(state: State) {
+	if (!stateFile) {return;}
+	try {
+		const tmp = `${stateFile}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify({ ...state, ownerPid: process.pid }));
+		fs.renameSync(tmp, stateFile);
+	} catch (error) {
+		console.error('Codeography: failed to persist queue:', error);
+	}
+}
+
+// Writing the whole queue on every keystroke-driven event is wasteful; a
+// short debounce bounds crash loss to ~1 s while keeping disk writes cheap.
+function schedulePersist(state: State) {
+	if (persistTimer) {return;}
+	persistTimer = setTimeout(() => { persistTimer = null; writeState(state); refreshStatusBar(); }, 1000);
+}
+
+function flushPersist() {
+	if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+	if (recorder) {writeState(recorder.state);}
+}
+
+function isAlive(pid: number): boolean {
+	try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+// Adopt queues left by windows whose extension host is gone (crash, kill,
+// offline shutdown). The rename is an atomic claim, so two windows starting
+// together cannot both adopt (and double-send) the same file.
+function recoverOrphans(dir: string, into: State) {
+	for (const name of fs.readdirSync(dir)) {
+		if (!name.startsWith(STATE_PREFIX) || !name.endsWith('.json')) {continue;}
+		const file = path.join(dir, name);
+		if (file === stateFile) {continue;}
+		try {
+			const owner = JSON.parse(fs.readFileSync(file, 'utf8')).ownerPid;
+			// Our own pid on a file that is not ours means a previous activation in
+			// this same extension host (extension disabled and re-enabled).
+			if (typeof owner === 'number' && owner !== process.pid && isAlive(owner)) {continue;}
+			// Still matches state-*.json, so a crash mid-recovery leaves it
+			// recoverable; mergeRecovered de-duplicates by clientEventId.
+			const claimed = path.join(dir, `${STATE_PREFIX}claimed-${process.pid}-${name.slice(STATE_PREFIX.length)}`);
+			fs.renameSync(file, claimed);
+			mergeRecovered(into, JSON.parse(fs.readFileSync(claimed, 'utf8')));
+			writeState(into);
+			fs.unlinkSync(claimed);
+		} catch (error) {
+			console.error('Codeography: could not recover', name, error);
+		}
+	}
+}
+
+// ---------- network ----------
+
+async function post(body: SyncBody): Promise<number> {
+	const apiKey = secretStorage ? await secretStorage.get(SECRET_KEY) : undefined;
+	if (!apiKey) {return 401;}
+	try {
+		const response = await fetch(`${API_URL}/api/sessions`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+			body: JSON.stringify(body),
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+		});
+		return response.status;
+	} catch (error) {
+		console.error('Codeography: sync request failed:', error);
+		return 0;
+	}
+}
+
+async function syncNow() {
+	if (!recorder || !secretStorage) {return;}
+	hasKey = !!(await secretStorage.get(SECRET_KEY));
+	const result = await recorder.sync(hasKey);
+	if (result === 'ok') {syncProblem = null;}
+	if (result === 'unauthorized') {
+		syncProblem = 'unauthorized';
+		console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
+	}
+	if (result === 'rejected') {
+		syncProblem = 'rejected';
+		console.error('Codeography: the server rejected the upload; events stay queued and will retry.');
+	}
+	if (result === 'retry') {console.warn('Codeography: sync deferred; events stay queued and will retry.');}
+	refreshStatusBar();
+}
+
+function keySaved() {
+	hasKey = true;
+	syncProblem = null;
+	refreshStatusBar();
+	void syncNow();
 }
 
 export function activate(context: vscode.ExtensionContext) {
 	storageDir = context.globalStorageUri.fsPath;
 	secretStorage = context.secrets;
+	fs.mkdirSync(storageDir, { recursive: true });
+	stateFile = path.join(storageDir, `${STATE_PREFIX}${randomUUID()}.json`);
 
-	if (!fs.existsSync(storageDir)) {
-		fs.mkdirSync(storageDir, { recursive: true });
-	}
+	const state = emptyState();
+	recorder = new Recorder(state, {
+		now: () => Date.now(),
+		uuid: () => randomUUID(),
+		post,
+		persist: schedulePersist,
+	});
+	recoverOrphans(storageDir, state);
 
-	statusBar = vscode.window.createStatusBarItem(
-		vscode.StatusBarAlignment.Left,
-		100
-	);
+	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusBar.command = 'codeography.setApiKey';
 	statusBar.show();
 	context.subscriptions.push(statusBar);
 
 	// Reflect the REAL state: a user with a dead key must never see a
 	// confident "recording" light while nothing is actually syncing.
-	void refreshStatusBar();
+	refreshStatusBar();
 
 	// Command: Set API Key
 	const setKeyCommand = vscode.commands.registerCommand(
@@ -143,9 +196,8 @@ export function activate(context: vscode.ExtensionContext) {
 			});
 			if (key && secretStorage) {
 				await secretStorage.store(SECRET_KEY, key.trim());
-				lastSyncFailed = false;
-				void refreshStatusBar();
 				vscode.window.showInformationMessage('Codeography: API key saved.');
+				keySaved();
 			}
 		}
 	);
@@ -155,7 +207,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// Triggered by the "Connect to VS Code" button on codeography.dev/dashboard.
 	const uriHandler = vscode.window.registerUriHandler({
 		handleUri(uri: vscode.Uri) {
-			if (uri.path !== '/connect') return;
+			if (uri.path !== '/connect') {return;}
 			const key = new URLSearchParams(uri.query).get('key')?.trim();
 			// Basic sanity check — only accept something shaped like a real key.
 			// Prevents a malicious link from storing arbitrary junk in SecretStorage.
@@ -165,243 +217,100 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 			if (secretStorage) {
 				secretStorage.store(SECRET_KEY, key).then(() => {
-					lastSyncFailed = false;
-					void refreshStatusBar();
 					vscode.window.showInformationMessage('Codeography: Connected! Your session recording is now active.');
+					keySaved();
 				});
 			}
 		}
 	});
 	context.subscriptions.push(uriHandler);
 
-	startSession();
-
+	// The timer also ends idle sessions, so a session finalizes ~15-20 min
+	// after the last activity instead of waiting for the next keystroke.
 	syncTimer = setInterval(() => {
-		syncEvents();
+		recorder?.endIfIdle();
+		void syncNow();
 	}, SYNC_INTERVAL_MS);
+	void syncNow(); // reads the key state and delivers anything recovered from a previous run
+
+	// Only real files on disk. Git diff views, settings, output panels and
+	// untitled buffers use other URI schemes and are not the developer's files.
+	// Generated paths (node_modules, .git, build output) are not authored files.
+	const isFile = (doc: vscode.TextDocument) => doc.uri.scheme === 'file' && !isGeneratedPath(doc.uri.fsPath);
+
+	const deduper = new WriteDeduper();
 
 	const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
-		// Mark this file as just saved through VS Code's own save command,
-		// so the file-system watcher below doesn't double-count it as an
-		// external change a moment later.
-		recentVSCodeSaves.add(doc.uri.fsPath);
-		trackEvent({
-			type: 'file_saved',
-			fileName: getBaseName(doc.fileName),
-			language: doc.languageId,
-			timestamp: new Date().toISOString()
-		});
+		if (!isFile(doc)) {return;}
+		deduper.save(doc.uri.fsPath, Date.now());
+		recorder?.track({ type: 'file_saved', fileName: reportableName(doc.fileName), language: doc.languageId });
 	});
 
-	// Watches for file changes written directly to disk — catches AI
-	// coding agents (like the standalone Claude Code CLI) that write
-	// files without going through VS Code's own save command, which
-	// onDidSaveTextDocument alone would completely miss.
+	// Watches for file changes written directly to disk — catches AI coding
+	// agents (like the standalone Claude Code CLI), formatters and other tools
+	// that write files without going through VS Code's save. These stay a
+	// separate event type and are never counted as developer saves.
 	const fsWatcher = vscode.workspace.createFileSystemWatcher('**/*');
-	const recentVSCodeSaves = new Set<string>();
-
-	fsWatcher.onDidChange((uri) => {
-		const key = uri.fsPath;
-		// If VS Code itself just saved this file, skip it — onDidSaveTextDocument
-		// already tracked it as a real file_saved event, so this is not a second,
-		// separate write.
-		if (recentVSCodeSaves.has(key)) {
-			recentVSCodeSaves.delete(key);
-			return;
+	const onDisk = (uri: vscode.Uri) => {
+		if (uri.scheme !== 'file' || isGeneratedPath(uri.fsPath)) {return;}
+		deduper.external(uri.fsPath, Date.now());
+	};
+	fsWatcher.onDidChange(onDisk);
+	fsWatcher.onDidCreate(onDisk);
+	const emitWrites = (now: number) => {
+		for (const w of deduper.flush(now)) {
+			recorder?.track({ type: 'file_changed_externally', fileName: reportableName(w.path), language: languageForPath(w.path) });
 		}
-		// Derive a language from the file extension since this event has
-		// no VS Code document object to read languageId from directly.
-		const base = getBaseName(key);
-		const dot = base.lastIndexOf('.');
-		const ext = dot > 0 ? base.slice(dot + 1).toLowerCase() : undefined;
-		const extToLanguage: Record<string, string> = {
-			ts: 'typescript', tsx: 'typescriptreact', js: 'javascript', jsx: 'javascriptreact',
-			py: 'python', java: 'java', go: 'go', rs: 'rust', c: 'c', cpp: 'cpp', cs: 'csharp',
-			json: 'json', md: 'markdown', html: 'html', css: 'css', yml: 'yaml', yaml: 'yaml',
-			sql: 'sql', sh: 'shellscript', rb: 'ruby', php: 'php',
-		};
-		trackEvent({
-			type: 'file_changed_externally',
-			fileName: getBaseName(key),
-			language: (ext && extToLanguage[ext]) || 'plaintext',
-			timestamp: new Date().toISOString()
-		});
-	});
+	};
+	const dedupeTimer = setInterval(() => emitWrites(Date.now()), WRITE_DEDUPE_MS / 2);
+	// On shutdown, writes still inside their dedupe window belong to this session.
+	flushPendingWrites = () => { clearInterval(dedupeTimer); emitWrites(Number.POSITIVE_INFINITY); };
 
 	const onOpen = vscode.workspace.onDidOpenTextDocument((doc) => {
-		trackEvent({
-			type: 'file_opened',
-			fileName: getBaseName(doc.fileName),
-			language: doc.languageId,
-			timestamp: new Date().toISOString()
-		});
+		if (!isFile(doc)) {return;}
+		recorder?.track({ type: 'file_opened', fileName: reportableName(doc.fileName), language: doc.languageId });
 	});
 
-	const onDiagnosticsChange = vscode.languages.onDidChangeDiagnostics((e) => {
-		if (errorDebounceTimer) clearTimeout(errorDebounceTimer);
+	let errorDebounceTimer: NodeJS.Timeout | null = null;
+	const onDiagnosticsChange = vscode.languages.onDidChangeDiagnostics(() => {
+		if (errorDebounceTimer) {clearTimeout(errorDebounceTimer);}
 		// Short debounce so even brief errors that are quickly fixed get captured
 		errorDebounceTimer = setTimeout(() => {
-			// Count total errors across ALL open files, not just changed ones
+			// Count total errors across ALL open files (workspace-wide)
 			let totalErrors = 0;
 			vscode.languages.getDiagnostics().forEach(([, diags]) => {
 				totalErrors += diags.filter(d => d.severity === vscode.DiagnosticSeverity.Error).length;
 			});
-
-			// Track the session-wide error arc
-			if (totalErrors > peakErrors) peakErrors = totalErrors;
-			if (totalErrors > 0) errorsEverAppeared = true;
-			// If error count dropped, the developer fixed that many errors
-			if (totalErrors < lastErrorCount) {
-				totalErrorsFixed += (lastErrorCount - totalErrors);
-			}
-			lastErrorCount = totalErrors;
-
-			trackEvent({
-				type: 'error_count_changed',
-				errorCount: totalErrors,
-				timestamp: new Date().toISOString()
-			});
+			recorder?.trackErrors(totalErrors);
 		}, 300);
 	});
 
-	const gitWatcher = vscode.workspace.createFileSystemWatcher(
-		'**/.git/COMMIT_EDITMSG'
-	);
-	gitWatcher.onDidChange(() => {
-		trackEvent({
-			type: 'git_commit_created',
-			project: activeProject,
-			timestamp: new Date().toISOString()
-		});
-	});
-
-	context.subscriptions.push(onSave, onOpen, onDiagnosticsChange, gitWatcher);
-}
-
-function startSession() {
-	sessionStart = new Date();
-	clientSessionId = (globalThis.crypto?.randomUUID?.() ?? `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-	lastActivityAt = Date.now();
-	const workspaceFolders = vscode.workspace.workspaceFolders;
-	activeProject = workspaceFolders ? workspaceFolders[0].name : 'unknown';
-	trackEvent({
-		type: 'session_started',
-		project: activeProject,
-		timestamp: sessionStart.toISOString()
-	});
-	console.log(`Session started: ${activeProject} (${clientSessionId})`);
-}
-
-function trackEvent(event: object) {
-	const now = Date.now();
-	if (sessionStart && (now - lastActivityAt) > IDLE_GAP_MS) {
-		console.log('Idle gap detected — finalizing previous session.');
-		void syncEvents(true);
-		startSession();
+	// Commits: git appends a line to .git/logs/HEAD after every ref update.
+	// Only `commit:` lines (including amend/initial/merge) are commits; pulls,
+	// checkouts and resets write other prefixes, and aborted commits write
+	// nothing. Hooks, GPG prompts and `--wait` editors cannot race this.
+	const reflogOffset = new Map<string, number>();
+	for (const folder of vscode.workspace.workspaceFolders ?? []) {
+		const log = path.join(folder.uri.fsPath, '.git', 'logs', 'HEAD');
+		if (fs.existsSync(log)) {reflogOffset.set(log, fs.statSync(log).size);}
 	}
-	lastActivityAt = now;
-	eventQueue.push(event);
-	void refreshStatusBar();
-	console.log('Event tracked:', event);
-	persistEvents();
-}
-
-function persistEvents() {
-	if (!storageDir) return;
-	try {
-		const fileName = `codeography-${new Date().toISOString().split('T')[0]}.json`;
-		const filePath = path.join(storageDir, fileName);
-		fs.writeFileSync(filePath, JSON.stringify(eventQueue, null, 2));
-	} catch (error) {
-		console.error('Failed to persist events:', error);
-	}
-}
-
-async function syncEvents(finalize: boolean = false) {
-	if (!API_URL.startsWith('https://')) {
-		console.error('Codeography: API_URL must use HTTPS. Aborting sync.')
-		return
-	}
-	if (eventQueue.length === 0 || !activeProject) return;
-	if (!secretStorage) return;
-
-	// Substance gate: on finalize, a session with too few events is
-	// trivial background noise, not real work. Discard it instead of
-	// sending junk to the backend.
-	if (finalize && eventQueue.length < MIN_SESSION_EVENTS) {
-		console.log(`Codeography: discarding trivial session (${eventQueue.length} events).`);
-		eventQueue = [];
-		persistEvents();
-		sessionStart = null;
-		clientSessionId = null;
-		peakErrors = 0;
-		totalErrorsFixed = 0;
-		errorsEverAppeared = false;
-		lastErrorCount = 0;
-		return;
-	}
-
-	const apiKey = await secretStorage.get(SECRET_KEY);
-	if (!apiKey) {
-		console.warn('Codeography: No API key set. Run "Codeography: Set API Key" first.');
-		return;
-	}
-
-	try {
-		const response = await fetch(`${API_URL}/api/sessions`, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'Authorization': `Bearer ${apiKey}`,
-			},
-			body: JSON.stringify({
-				project: activeProject,
-				clientSessionId: clientSessionId,
-				finalize: finalize,
-				events: eventQueue,
-				startedAt: sessionStart?.toISOString(),
-				durationMinutes: sessionStart
-					? Math.round((Date.now() - sessionStart.getTime()) / 60000)
-					: 0,
-				errorSummary: {
-					peakErrors,
-					totalErrorsFixed,
-					errorsEverAppeared,
-					resolved: errorsEverAppeared && lastErrorCount === 0
-				}
-			})
-		});
-
-		if (response.ok) {
-			lastSyncFailed = false;
-			void refreshStatusBar();
-			console.log(`Synced ${eventQueue.length} events to backend`);
-			// Clear the queue after a successful sync so we don't re-send
-			eventQueue = [];
-			persistEvents();
-			// Do NOT reset sessionStart here — the session clock keeps running
-			// across syncs so duration measures the whole session. Error trackers
-			// also persist across the session and only reset on a fresh startSession().
-			if (finalize) {
-				// Session ended: clear session state so the next activity starts clean
-				sessionStart = null;
-				clientSessionId = null;
-				peakErrors = 0;
-				totalErrorsFixed = 0;
-				errorsEverAppeared = false;
-				lastErrorCount = 0;
-			}
-		} else if (response.status === 401) {
-			lastSyncFailed = true;
-			void refreshStatusBar();
-			console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
-		} else {
-			console.error('Sync failed:', response.status);
+	const gitWatcher = vscode.workspace.createFileSystemWatcher('**/.git/logs/HEAD');
+	const onReflog = (uri: vscode.Uri) => {
+		const { lines, size } = readReflogSince(uri.fsPath, reflogOffset.get(uri.fsPath));
+		reflogOffset.set(uri.fsPath, size);
+		const includeSha = vscode.workspace.getConfiguration('codeography').get<boolean>('includeCommitSha', false);
+		for (const line of lines) {
+			const commit = parseReflogCommit(line);
+			if (commit) {recorder?.track({ type: 'git_commit_created', ...(includeSha ? { sha: commit.sha.slice(0, 7) } : {}) });}
 		}
-	} catch (error) {
-		// Silent fail — events are still saved locally
-		console.error('Sync error:', error);
-	}
+	};
+	gitWatcher.onDidChange(onReflog);
+	gitWatcher.onDidCreate(onReflog);
+
+	context.subscriptions.push(
+		onSave, onOpen, onDiagnosticsChange, fsWatcher, gitWatcher,
+		{ dispose: () => clearInterval(dedupeTimer) },
+	);
 }
 
 // VS Code waits for a Promise returned from deactivate() before killing the
@@ -409,42 +318,27 @@ async function syncEvents(finalize: boolean = false) {
 // forgetting) is what lets the session actually finalize on a clean close —
 // so the user's story appears in seconds, not minutes.
 export async function deactivate() {
-	if (syncTimer) clearInterval(syncTimer);
+	if (syncTimer) {clearInterval(syncTimer);}
 
 	if (statusBar) {
 		statusBar.text = '$(circle-outline) Codeography';
 		statusBar.tooltip = 'Codeography session ended';
 	}
 
-	// Record the session_ended event BEFORE syncing, so it actually gets sent.
-	trackEvent({
-		type: 'session_ended',
-		project: activeProject,
-		timestamp: new Date().toISOString(),
-		totalEvents: eventQueue.length,
-		durationMinutes: sessionStart
-			? Math.round((Date.now() - sessionStart.getTime()) / 60000)
-			: 0
-	});
+	// Record session_ended and mark the session for finalization, then
+	// persist BEFORE the network call: if the sync does not land within the
+	// cap, the next VS Code start recovers the queue and finalizes it.
+	flushPendingWrites?.();
+	recorder?.shutdown();
+	flushPersist();
 
-	console.log('Session ended. Total events:', eventQueue.length);
-
-	// Finalize the session. Await it so VS Code waits for the network call,
-	// but cap the wait so a slow/offline network can never hang shutdown.
-	// If this doesn't land, the backend cron sweep finalizes it anyway.
 	await Promise.race([
-		syncEvents(true),
+		syncNow(),
 		new Promise<void>((resolve) => setTimeout(resolve, 3000)),
 	]);
+	flushPersist();
+	// A fully drained window leaves nothing to recover.
+	if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
+		try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
+	}
 }
-
-// isolated test
-// isolated test
-// isolated test
-// isolated test
-// isolated test
-// isolated test
-// isolated test
-// isolated test
-// isolated test
-// final marketplace test

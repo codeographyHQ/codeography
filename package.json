@@ -21,7 +21,17 @@
         "command": "codeography.setApiKey",
         "title": "Codeography: Set API Key"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Codeography",
+      "properties": {
+        "codeography.includeCommitSha": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include the short (7-character) SHA in commit events. Off by default: a SHA can identify a public repository."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -29,7 +39,8 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "test:unit": "npm run compile && node --test \"out/test/unit/*.test.js\""
   },
   "devDependencies": {
     "@types/vscode": "^1.115.0",
