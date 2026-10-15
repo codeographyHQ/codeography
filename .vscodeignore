@@ -1,11 +1,11 @@
-.vscode/**
-.vscode-test/**
-src/**
-.gitignore
-.yarnrc
-vsc-extension-quickstart.md
-**/tsconfig.json
-**/eslint.config.mjs
-**/*.map
-**/*.ts
-**/.vscode-test.*
+# Allowlist: ship only what the extension needs at runtime. Everything else
+# (local tooling folders, browser profiles, graphs, tests, sources, old .vsix
+# files) is excluded by default, so new local files can never leak into a package.
+**
+!out/extension.js
+!out/core.js
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!icon.png
