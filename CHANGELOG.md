@@ -2,7 +2,7 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
-## [Unreleased]
+## [0.1.12]
 
 - Fixed: an idle session could be finalized under the next session's id,
   after which every sync created a separate session. Each event now carries
