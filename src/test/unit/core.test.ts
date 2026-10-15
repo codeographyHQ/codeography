@@ -6,7 +6,7 @@ import * as path from 'path';
 import {
 	Recorder, State, SyncBody, QueuedEvent, WriteDeduper, IDLE_GAP_MS, MAX_EVENTS_PER_SYNC,
 	emptyState, mergeRecovered, isSensitiveName, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince,
+	parseReflogCommit, readReflogSince, importLegacy,
 } from '../../core';
 
 const MIN = 60_000;
@@ -306,6 +306,63 @@ test('after shutdown, late callbacks cannot start a session nothing will end', (
 	assert.equal(Object.keys(h.rec.state.sessions).length, 1);
 });
 
+test('a session the backend refuses does not block other sessions, and keeps its events', async () => {
+	const h = harness([400]); // first session refused, the rest accepted
+	save(h.rec, 'old.ts');
+	const stuck = h.rec.state.current!;
+	h.rec.endCurrent();
+	h.advance(MIN);
+	save(h.rec, 'new.ts');
+	h.rec.endCurrent();
+	assert.equal(await h.rec.sync(true), 'rejected');
+	assert.ok(h.posts.some(p => p.clientSessionId !== stuck && p.finalize), 'later session still delivered');
+	assert.ok(h.rec.state.sessions[stuck], 'refused session kept');
+	assert.equal(h.rec.state.queue.filter(e => e.sid === stuck).length, 2);
+});
+
+test('other 4xx are refusals (no retry storm); 408/429 are retried', async () => {
+	for (const status of [403, 404, 409, 410]) {
+		const h = harness([status]);
+		save(h.rec);
+		assert.equal(await h.rec.sync(true), 'rejected', `status ${status}`);
+	}
+	for (const status of [408, 429]) {
+		const h = harness([status]);
+		save(h.rec);
+		assert.equal(await h.rec.sync(true), 'retry', `status ${status}`);
+	}
+});
+
+test('shutdown after a long idle ends the session at its last activity (no late session_ended)', async () => {
+	const h = harness();
+	save(h.rec);
+	h.advance(4 * 60 * MIN);
+	h.rec.shutdown();
+	await h.rec.sync(true);
+	assert.equal(h.posts[0].finalize, true);
+	assert.ok(!h.posts[0].events.some(e => e.type === 'session_ended'), 'no session_ended stamped hours later');
+	assert.equal(h.posts[0].durationMinutes, 0);
+});
+
+test('legacy 0.1.11 queue imports as one ended session with filtered names', async () => {
+	const h = harness();
+	const n = importLegacy(h.rec.state, [
+		{ type: 'session_started', project: 'Client Co', timestamp: '2026-09-01T10:00:00.000Z' },
+		{ type: 'file_saved', fileName: '/Users/me/Client Co/.env.production', language: 'dotenv', timestamp: '2026-09-01T10:01:00.000Z' },
+		{ type: 'file_saved', fileName: 'app.ts', language: 'typescript', timestamp: '2026-09-01T10:02:00.000Z' },
+		{ type: 'weird', timestamp: '2026-09-01T10:03:00.000Z' },
+		{ type: 'file_saved', timestamp: 'not a date' },
+	], () => `L${Math.random()}`);
+	assert.equal(n, 3);
+	await h.rec.sync(true);
+	const p = h.posts[0];
+	assert.equal(p.finalize, true);
+	assert.deepEqual(p.events.map(e => e.fileName), [undefined, undefined, 'app.ts'], 'secret name withheld, path stripped');
+	assert.ok(!JSON.stringify(p).includes('Client Co'), 'legacy project name never sent');
+	assert.equal(p.durationMinutes, 2);
+	assert.equal(importLegacy(h.rec.state, 'garbage', () => 'x'), 0);
+});
+
 test('concurrent sync calls share one run (no double send)', async () => {
 	const h = harness();
 	save(h.rec);
@@ -391,6 +448,9 @@ test('generated and VCS paths are not external writes', () => {
 	assert.ok(isGeneratedPath('/r/.gstack/chromium-profile/Default/Cookies'));
 	assert.ok(!isGeneratedPath('/r/src/out-of-band.ts'));
 	assert.ok(!isGeneratedPath('/r/src/index.ts'));
+	// callers pass the workspace-relative path, so a project under ~/build is fine:
+	assert.ok(!isGeneratedPath('src/app.ts'));
+	assert.ok(isGeneratedPath('build/app.js'));
 });
 
 test('sensitive file names are withheld; normal names and paths are reduced to basenames', () => {
@@ -414,8 +474,12 @@ test('reflog: only real commits count, never the message', () => {
 	assert.deepEqual(parseReflogCommit(line('commit (amend): reword')), { sha: B });
 	assert.deepEqual(parseReflogCommit(line('commit (initial): first')), { sha: B });
 	assert.deepEqual(parseReflogCommit(line('commit (merge): Merge branch x')), { sha: B });
+	assert.deepEqual(parseReflogCommit(line('cherry-pick: port fix')), { sha: B });
+	assert.deepEqual(parseReflogCommit(line('revert: Revert "x"')), { sha: B });
+	assert.deepEqual(parseReflogCommit(line("merge feature: Merge made by the 'ort' strategy.")), { sha: B });
+	assert.deepEqual(parseReflogCommit(line("pull: Merge made by the 'ort' strategy.")), { sha: B });
 	for (const msg of ['pull: Fast-forward', 'checkout: moving from main to x', 'reset: moving to HEAD~1',
-		'rebase (pick): thing', 'merge feature: Fast-forward', 'cherry-pick: thing']) {
+		'rebase (pick): thing', 'merge feature: Fast-forward', 'pull --rebase (finish): returning to refs/heads/main']) {
 		assert.equal(parseReflogCommit(line(msg)), null, msg);
 	}
 	assert.equal(parseReflogCommit('garbage'), null);
@@ -432,8 +496,18 @@ test('reflog: reads every line appended since the last offset; rewritten log is 
 	const r = readReflogSince(file, base);
 	assert.equal(r.lines.length, 3, 'two quick commits are both seen');
 	assert.equal(r.lines.map(parseReflogCommit).filter(Boolean).length, 2);
-	fs.writeFileSync(file, line('commit: after expire') + '\n'); // log shrank
-	assert.equal(readReflogSince(file, r.size).lines.length, 1, 'only the newest line, old commits not replayed');
+	fs.writeFileSync(file, line('commit: old entry kept by expire') + '\n'); // git gc / reflog expire shrank it
+	const shrunk = readReflogSince(file, r.size);
+	assert.equal(shrunk.lines.length, 0, 'a shrunken log replays nothing');
+	assert.equal(shrunk.size, fs.statSync(file).size, 'offset resets to the new end');
+	const half = line('commit: written in two parts');
+	fs.appendFileSync(file, half.slice(0, 30)); // caught mid-write
+	const p1 = readReflogSince(file, shrunk.size);
+	assert.deepEqual(p1.lines, [], 'partial line not consumed');
+	assert.equal(p1.size, shrunk.size);
+	fs.appendFileSync(file, half.slice(30) + '\n');
+	const p2 = readReflogSince(file, p1.size);
+	assert.deepEqual(p2.lines.map(parseReflogCommit), [{ sha: B }], 'whole line read once complete');
 	assert.deepEqual(readReflogSince(path.join(dir, 'missing'), 10), { lines: [], size: 10 });
 	fs.rmSync(dir, { recursive: true, force: true });
 });

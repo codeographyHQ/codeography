@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince,
+	parseReflogCommit, readReflogSince, importLegacy,
 } from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
@@ -24,6 +24,7 @@ let persistTimer: NodeJS.Timeout | null = null;
 let flushPendingWrites: (() => void) | null = null;
 // Cached so the status bar never needs a keychain read per event.
 let hasKey = false;
+let syncKey: string | undefined; // read once per sync, not per request
 let syncProblem: Extract<SyncResult, 'unauthorized' | 'rejected'> | null = null;
 
 // The status bar must tell the truth about state — not just that the
@@ -118,10 +119,31 @@ function recoverOrphans(dir: string, into: State) {
 	}
 }
 
+// Extension <= 0.1.11 kept its queue in codeography-YYYY-MM-DD.json. A
+// successful sync rewrote the current day's file as [], so only the newest
+// file can hold unsent events; older days are stale copies of sent events.
+// Import the newest as one ended session, then delete them all: they also
+// hold file names that were never filtered.
+function migrateLegacy(dir: string, into: State) {
+	const files = fs.readdirSync(dir).filter(n => /^codeography-\d{4}-\d{2}-\d{2}\.json$/.test(n)).sort();
+	if (files.length === 0) {return;}
+	try {
+		const n = importLegacy(into, JSON.parse(fs.readFileSync(path.join(dir, files[files.length - 1]), 'utf8')), randomUUID);
+		writeState(into);
+		console.log(`Codeography: migrated ${n} unsent events from an older version.`);
+	} catch (error) {
+		console.error('Codeography: could not read the old queue file; leaving it in place.', error);
+		return;
+	}
+	for (const f of files) {
+		try { fs.unlinkSync(path.join(dir, f)); } catch { /* already gone */ }
+	}
+}
+
 // ---------- network ----------
 
 async function post(body: SyncBody): Promise<number> {
-	const apiKey = secretStorage ? await secretStorage.get(SECRET_KEY) : undefined;
+	const apiKey = syncKey;
 	if (!apiKey) {return 401;}
 	try {
 		const response = await fetch(`${API_URL}/api/sessions`, {
@@ -139,7 +161,8 @@ async function post(body: SyncBody): Promise<number> {
 
 async function syncNow() {
 	if (!recorder || !secretStorage) {return;}
-	hasKey = !!(await secretStorage.get(SECRET_KEY));
+	syncKey = await secretStorage.get(SECRET_KEY);
+	hasKey = !!syncKey;
 	const result = await recorder.sync(hasKey);
 	if (result === 'ok') {syncProblem = null;}
 	if (result === 'unauthorized') {
@@ -175,6 +198,7 @@ export function activate(context: vscode.ExtensionContext) {
 		persist: schedulePersist,
 	});
 	recoverOrphans(storageDir, state);
+	migrateLegacy(storageDir, state);
 
 	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusBar.command = 'codeography.setApiKey';
@@ -182,8 +206,11 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(statusBar);
 
 	// Reflect the REAL state: a user with a dead key must never see a
-	// confident "recording" light while nothing is actually syncing.
-	refreshStatusBar();
+	// confident "recording" light while nothing is actually syncing, and a
+	// configured user must not see a "set API key" warning while the key is
+	// still being read. Neutral until the keychain answers.
+	statusBar.text = '$(circle-outline) Codeography';
+	void secretStorage.get(SECRET_KEY).then(k => { hasKey = !!k; refreshStatusBar(); });
 
 	// Command: Set API Key
 	const setKeyCommand = vscode.commands.registerCommand(
@@ -236,7 +263,13 @@ export function activate(context: vscode.ExtensionContext) {
 	// Only real files on disk. Git diff views, settings, output panels and
 	// untitled buffers use other URI schemes and are not the developer's files.
 	// Generated paths (node_modules, .git, build output) are not authored files.
-	const isFile = (doc: vscode.TextDocument) => doc.uri.scheme === 'file' && !isGeneratedPath(doc.uri.fsPath);
+	// Judged on the path inside the workspace, so a project kept under a folder
+	// like ~/build or C:\\work\\dist is not treated as generated as a whole.
+	const isGenerated = (uri: vscode.Uri) => {
+		const rel = vscode.workspace.asRelativePath(uri, false);
+		return isGeneratedPath(path.isAbsolute(rel) ? path.basename(uri.fsPath) : rel);
+	};
+	const isFile = (doc: vscode.TextDocument) => doc.uri.scheme === 'file' && !isGenerated(doc.uri);
 
 	const deduper = new WriteDeduper();
 
@@ -252,7 +285,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// separate event type and are never counted as developer saves.
 	const fsWatcher = vscode.workspace.createFileSystemWatcher('**/*');
 	const onDisk = (uri: vscode.Uri) => {
-		if (uri.scheme !== 'file' || isGeneratedPath(uri.fsPath)) {return;}
+		if (uri.scheme !== 'file' || isGenerated(uri)) {return;}
 		deduper.external(uri.fsPath, Date.now());
 	};
 	fsWatcher.onDidChange(onDisk);

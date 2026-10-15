@@ -9,7 +9,8 @@ import * as fs from 'fs';
 // - A session id stays in `sessions` until a sync with finalize:true for it
 //   has succeeded.
 // - Events leave the queue only after the backend acknowledged that exact
-//   request (2xx), or after a permanent rejection (moved to a local file).
+//   request (2xx). A session the backend refuses stays queued and is skipped
+//   for that pass, so it cannot block other sessions.
 // - Each event gets its clientEventId once, at creation; retries resend it.
 
 export const IDLE_GAP_MS = 15 * 60 * 1000;
@@ -131,6 +132,8 @@ export class Recorder {
 	 * new session that nothing will ever end.
 	 */
 	shutdown(): void {
+		// A session that already went idle ended at its last activity, not now.
+		this.endIfIdle();
 		const id = this.state.current;
 		if (id) {
 			this.push(this.state.sessions[id], { type: 'session_ended' }, this.deps.now());
@@ -156,6 +159,7 @@ export class Recorder {
 	}
 
 	private async drain(): Promise<SyncResult> {
+		let refused = false;
 		const ordered = Object.values(this.state.sessions)
 			.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
 		for (const meta of ordered) {
@@ -172,11 +176,16 @@ export class Recorder {
 					this.deps.persist(this.state);
 					continue;
 				}
-				if (status === 400 || status === 413 || status === 422) {return 'rejected';}
-				return status === 401 ? 'unauthorized' : 'retry';
+				if (status === 401) {return 'unauthorized';}
+				if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+					// Refused for this session: keep its events, move on to the others.
+					refused = true;
+					break;
+				}
+				return 'retry'; // 0 (network/timeout), 408, 429, 5xx
 			}
 		}
-		return 'ok';
+		return refused ? 'rejected' : 'ok';
 	}
 
 	private body(meta: SessionMeta, chunk: QueuedEvent[], finalize: boolean): SyncBody {
@@ -249,40 +258,78 @@ export function mergeRecovered(into: State, recovered: State): void {
 	}
 }
 
+const EVENT_TYPES = new Set(['session_started', 'session_ended', 'file_opened', 'file_saved',
+	'file_changed_externally', 'error_count_changed', 'git_commit_created']);
+
+/**
+ * Imports an event array persisted by extension <= 0.1.11 (no session or
+ * event ids) as one ended session. Only known fields are kept and file names
+ * pass the same filter as new events. Returns the number of events imported.
+ */
+export function importLegacy(into: State, events: unknown, uuid: () => string): number {
+	if (!Array.isArray(events)) {return 0;}
+	const valid = events.filter((e): e is Record<string, unknown> =>
+		!!e && typeof e === 'object' && EVENT_TYPES.has(String((e as Record<string, unknown>).type))
+		&& !Number.isNaN(Date.parse(String((e as Record<string, unknown>).timestamp))));
+	if (valid.length === 0) {return 0;}
+	const sid = uuid();
+	for (const e of valid) {
+		into.queue.push({
+			clientEventId: uuid(), sid, type: String(e.type), timestamp: new Date(String(e.timestamp)).toISOString(),
+			...(typeof e.fileName === 'string' ? { fileName: reportableName(e.fileName) } : {}),
+			...(typeof e.language === 'string' ? { language: e.language } : {}),
+			...(typeof e.errorCount === 'number' ? { errorCount: e.errorCount } : {}),
+		});
+	}
+	const times = valid.map(e => Date.parse(String(e.timestamp)));
+	into.sessions[sid] = {
+		id: sid, startedAt: new Date(Math.min(...times)).toISOString(), lastActivityAt: Math.max(...times),
+		ended: true, lastErrorCount: 0,
+	};
+	return valid.length;
+}
+
 // ---------- commits ----------
 
 /**
  * Parses one line of .git/logs/HEAD. Git appends a line only after a ref
- * update has happened, and the message prefix says what kind: `commit:`,
- * `commit (amend):`, `commit (initial):`, `commit (merge):` are commits;
- * checkout, pull, reset, rebase and others are not. Aborted commits write
- * nothing. The commit message after the prefix is never returned.
+ * update has happened, and the message prefix says what kind. Counted as a
+ * new commit: `commit:` (also amend/initial/merge), `cherry-pick:`, `revert:`,
+ * and a merge or pull that says "Merge made by" (a real merge commit).
+ * Not counted: fast-forwards, checkout, reset, rebase rewrites. Aborted
+ * commits write nothing. The commit message is never returned.
  */
 export function parseReflogCommit(line: string): { sha: string } | null {
 	const tab = line.indexOf('\t');
 	if (tab < 0) {return null;}
 	const sha = line.split(' ')[1];
 	if (!/^[0-9a-f]{40}$/.test(sha ?? '')) {return null;}
-	return /^commit( \((amend|initial|merge)\))?:/.test(line.slice(tab + 1)) ? { sha } : null;
+	const msg = line.slice(tab + 1);
+	const isCommit = /^(commit( \([a-z]+\))?|cherry-pick|revert):/.test(msg)
+		|| /^(merge|pull)\b[^:]*: Merge made by/.test(msg);
+	return isCommit ? { sha } : null;
 }
 
 /**
- * Reflog lines appended since `offset` (bytes). With no known offset, or if
- * the log shrank (expired/rewritten), returns only the newest line so old
- * commits are never re-counted. Returns the new offset to remember.
+ * Complete reflog lines appended since `offset` (bytes), and the offset to
+ * remember. The offset only advances past a full line, so a line caught
+ * mid-write is read whole next time. With no known offset, only the newest
+ * line is returned. If the log shrank (expired/rewritten), nothing is
+ * returned: old commits are never re-counted.
  */
 export function readReflogSince(file: string, offset: number | undefined): { lines: string[]; size: number } {
 	try {
 		const size = fs.statSync(file).size;
-		if (offset !== undefined && size === offset) {return { lines: [], size };}
-		const tailOnly = offset === undefined || size < offset;
-		const from = tailOnly ? Math.max(0, size - 4096) : offset;
+		if (offset !== undefined && size <= offset) {return { lines: [], size };}
+		const from = offset ?? Math.max(0, size - 4096);
 		const len = Math.min(size - from, 1 << 20);
 		const buf = Buffer.alloc(len);
 		const fd = fs.openSync(file, 'r');
-		try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
-		const lines = buf.toString('utf8').split('\n').filter(Boolean);
-		return { lines: tailOnly ? lines.slice(-1) : lines, size };
+		try { fs.readSync(fd, buf, 0, len, from); } finally { fs.closeSync(fd); }
+		const end = buf.lastIndexOf(0x0a);
+		if (end < 0) {return { lines: [], size: from };}
+		const lines = buf.subarray(0, end).toString('utf8').split('\n').filter(Boolean);
+		return { lines: offset === undefined ? lines.slice(-1) : lines, size: from + end + 1 };
 	} catch {
 		return { lines: [], size: offset ?? 0 };
 	}
@@ -338,7 +385,11 @@ const GENERATED_SEGMENTS = new Set([
 ]);
 const GENERATED_SUFFIXES = ['.map', '.tsbuildinfo', '.pyc', '.log'];
 
-/** Tool output and VCS internals that are not authored files. */
+/**
+ * Tool output and VCS internals that are not authored files. Pass the path
+ * relative to the workspace folder: folders above the project (a project
+ * kept under ~/build/...) must not count.
+ */
 export function isGeneratedPath(fullPath: string): boolean {
 	const parts = fullPath.split(/[\\/]/);
 	if (parts.some(p => GENERATED_SEGMENTS.has(p))) {return true;}
