@@ -36,9 +36,6 @@ export interface SessionMeta {
 	startedAt: string;
 	lastActivityAt: number;
 	ended: boolean;
-	peakErrors: number;
-	totalErrorsFixed: number;
-	errorsEverAppeared: boolean;
 	lastErrorCount: number;
 }
 
@@ -58,7 +55,6 @@ export interface SyncBody {
 	events: Omit<QueuedEvent, 'sid'>[];
 	startedAt: string;
 	durationMinutes: number;
-	errorSummary: { peakErrors: number; totalErrorsFixed: number; errorsEverAppeared: boolean; resolved: boolean };
 }
 
 export interface Deps {
@@ -197,12 +193,6 @@ export class Recorder {
 			})),
 			startedAt: meta.startedAt,
 			durationMinutes: Math.min(MAX_DURATION_MIN, Math.max(0, Math.round(minutes))),
-			errorSummary: {
-				peakErrors: meta.peakErrors,
-				totalErrorsFixed: meta.totalErrorsFixed,
-				errorsEverAppeared: meta.errorsEverAppeared,
-				resolved: meta.errorsEverAppeared && meta.lastErrorCount === 0,
-			},
 		};
 	}
 
@@ -214,7 +204,7 @@ export class Recorder {
 	private startSession(now: number): SessionMeta {
 		const s: SessionMeta = {
 			id: this.deps.uuid(), startedAt: new Date(now).toISOString(), lastActivityAt: now, ended: false,
-			peakErrors: 0, totalErrorsFixed: 0, errorsEverAppeared: false, lastErrorCount: 0,
+			lastErrorCount: 0,
 		};
 		this.state.sessions[s.id] = s;
 		this.state.current = s.id;
@@ -229,11 +219,6 @@ export class Recorder {
 	}
 
 	private recordErrors(s: SessionMeta, count: number, now: number): void {
-		if (count > s.lastErrorCount) {
-			s.errorsEverAppeared = true;
-			if (count > s.peakErrors) {s.peakErrors = count;}
-		}
-		if (count < s.lastErrorCount) {s.totalErrorsFixed += s.lastErrorCount - count;}
 		s.lastErrorCount = count;
 		this.push(s, { type: 'error_count_changed', errorCount: count }, now);
 	}
@@ -257,7 +242,7 @@ export function mergeRecovered(into: State, recovered: State): void {
 			const t = Date.parse(e.timestamp) || 0;
 			into.sessions[e.sid] = {
 				id: e.sid, startedAt: e.timestamp, lastActivityAt: t, ended: true,
-				peakErrors: 0, totalErrorsFixed: 0, errorsEverAppeared: false, lastErrorCount: 0,
+				lastErrorCount: 0,
 			};
 		}
 		into.queue.push(e);

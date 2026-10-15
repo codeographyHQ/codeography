@@ -30,6 +30,9 @@ All notable changes to the "codeography" extension will be documented in this fi
   project folder name is no longer sent.
 - Error-count changes no longer keep a session alive on their own.
 - Requests time out after 15 seconds instead of hanging.
+- The client-side `errorSummary` tally is no longer sent. The server builds
+  evidence from stored events and ignores it, and its limits could reject
+  uploads from very large workspaces.
 - The package now contains only the runtime files.
 
 ## [0.1.11]

@@ -157,11 +157,10 @@ test('diagnostics are passive: they never start or extend a session', () => {
 	const types = h.rec.state.queue.map(e => e.type);
 	assert.deepEqual(types, ['session_started', 'error_count_changed', 'file_saved'], 'baseline count recorded at start');
 	const meta = h.rec.state.sessions[h.rec.state.current!];
-	assert.equal(meta.peakErrors, 0, 'pre-existing errors are not this session\'s errors');
-	assert.equal(meta.errorsEverAppeared, false);
-	h.rec.trackErrors(5);
-	assert.equal(meta.peakErrors, 5, 'a rise above the baseline counts');
-	assert.equal(meta.errorsEverAppeared, true);
+	assert.equal(meta.lastErrorCount, 3, 'baseline is the count at session start');
+	const before = h.rec.state.queue.length;
+	h.rec.trackErrors(3);
+	assert.equal(h.rec.state.queue.length, before, 'an unchanged count records nothing');
 	const last = h.rec.state.sessions[h.rec.state.current!].lastActivityAt;
 	h.advance(MIN);
 	h.rec.trackErrors(0);
@@ -337,11 +336,14 @@ test('event id is generated once and survives retries and persistence', async ()
 	assert.deepEqual(h.posts[1].events.map(e => e.clientEventId), ids, 'retry keeps ids');
 });
 
-test('the wire format never includes the internal session tag', async () => {
+test('the wire format never includes the internal session tag or a client error tally', async () => {
 	const h = harness();
 	save(h.rec);
+	h.rec.trackErrors(20000);
 	await h.rec.sync(true);
 	assert.ok(h.posts[0].events.every(e => !('sid' in e)));
+	assert.ok(!('errorSummary' in h.posts[0]), 'errorSummary is not sent (backend ignores it; it could exceed its limits)');
+	assert.deepEqual(Object.keys(h.posts[0]).sort(), ['clientSessionId', 'durationMinutes', 'events', 'finalize', 'project', 'startedAt']);
 });
 
 // ---------- event quality ----------
