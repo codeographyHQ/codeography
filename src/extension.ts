@@ -34,6 +34,13 @@ function refreshStatusBar() {
 
 	const warn = new vscode.ThemeColor('statusBarItem.warningBackground');
 
+	if (keys?.unreadable) {
+		statusBar.text = '$(warning) Codeography · can\'t read API key';
+		statusBar.tooltip = 'Codeography could not read its API key from the system keychain, so nothing is syncing. Events stay queued.';
+		statusBar.backgroundColor = warn;
+		return;
+	}
+
 	// Until the keychain has answered once, the key is unknown, not missing.
 	if (!keys?.known) {
 		statusBar.text = '$(circle-outline) Codeography';

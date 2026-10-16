@@ -417,19 +417,47 @@ test('KeyCache.store writes storage and the cache together', async () => {
 	assert.equal(keys.known, true);
 });
 
-test('one key per sync pass: a key change mid-drain cannot split a session across keys', async () => {
+test('a key rotated mid-drain is used from the next request on, with no duplicate sends', async () => {
+	// Regenerating a key on the dashboard revokes the old one, so finishing the
+	// drain with the old key would only produce 401s.
 	const h = harness();
 	for (let i = 0; i < 2499; i++) {save(h.rec, `f${i}.ts`);}
 	h.rec.endCurrent();
 	h.duringPost(() => { h.duringPost(() => {}); void h.rec.sync('rotated'); }); // key changes after chunk 1
 	await h.rec.sync('original');
-	const sid = h.posts[0].clientSessionId;
-	const keysForSession = h.keysUsed.filter((_, i) => h.posts[i].clientSessionId === sid);
-	assert.ok(keysForSession.every(k => k === 'original'), 'the running pass keeps its key');
-	assert.equal(h.posts.length, 3, 'no second concurrent drain (re-entrant sync joins the running one)');
+	assert.deepEqual(h.keysUsed, ['original', 'rotated', 'rotated']);
 	assert.equal(h.posts.filter(p => p.finalize).length, 1, 'finalized exactly once');
 	const ids = h.posts.flatMap(p => p.events.map(e => e.clientEventId));
 	assert.equal(new Set(ids).size, ids.length, 'no event sent twice');
+	assert.equal(ids.length, 2500);
+});
+
+test('a key fixed during a failing sync gets its own pass right away', async () => {
+	const h = harness([401]); // the old key is rejected
+	save(h.rec);
+	h.duringPost(() => { h.duringPost(() => {}); void h.rec.sync('valid-key'); }); // user saves a valid key
+	assert.equal(await h.rec.sync('bad-key'), 'ok', 'the joined caller sees the valid key\'s result');
+	assert.deepEqual(h.keysUsed, ['bad-key', 'valid-key']);
+	assert.equal(h.rec.state.queue.length, 0);
+});
+
+test('a key removed mid-drain stops sending with it', async () => {
+	const h = harness();
+	for (let i = 0; i < 2499; i++) {save(h.rec);}
+	h.duringPost(() => { h.duringPost(() => {}); void h.rec.sync(undefined); }); // key deleted after chunk 1
+	assert.equal(await h.rec.sync('key'), 'no-key');
+	assert.equal(h.posts.length, 1, 'no further requests with the removed key');
+	assert.equal(h.rec.state.queue.length, 1500, 'the rest stays queued');
+});
+
+test('KeyCache: an always-failing keychain is reported, not hidden as "starting"', async () => {
+	const keys = new KeyCache(canceled, noWrite);
+	assert.equal(keys.unreadable, false, 'nothing tried yet');
+	await keys.refresh();
+	assert.equal(keys.unreadable, true);
+	const ok = new KeyCache(() => Promise.resolve('k'), noWrite);
+	await ok.refresh();
+	assert.equal(ok.unreadable, false);
 });
 
 test('regression: shutdown still finalizes when the key read is canceled (reload during smoke test)', async () => {

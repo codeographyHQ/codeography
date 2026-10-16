@@ -150,16 +150,25 @@ export class Recorder {
 	 * start to finish, so a key change can never split a session's chunks.
 	 */
 	sync(key: string | undefined): Promise<SyncResult> {
-		if (!key) {return Promise.resolve('no-key');}
 		this.nextKey = key;
 		if (this.inFlight) { this.again = true; return this.inFlight; }
+		if (!key) {return Promise.resolve('no-key');}
 		this.inFlight = (async () => {
 			// Yield first so this.inFlight is assigned before any work runs: a
 			// sync() call made during the first request then joins instead of
 			// starting a second, concurrent drain.
 			await Promise.resolve();
 			let result: SyncResult;
-			do { this.again = false; result = await this.drain(this.nextKey as string); } while (this.again && result === 'ok');
+			for (;;) {
+				this.again = false;
+				const used = this.nextKey;
+				if (!used) { result = 'no-key'; break; }   // key removed meanwhile
+				result = await this.drain(used);
+				// A different key gets its own pass whatever this pass returned, so
+				// a key fixed after a 401 is tried now, not at the next tick.
+				if (this.nextKey !== used || (this.again && result === 'ok')) {continue;}
+				break;
+			}
 			return result;
 		})().finally(() => { this.inFlight = null; });
 		return this.inFlight;
@@ -175,6 +184,8 @@ export class Recorder {
 				if (pending.length === 0 && !meta.ended) {break;}
 				const chunk = pending.slice(0, MAX_EVENTS_PER_SYNC);
 				const finalize = meta.ended && pending.length <= MAX_EVENTS_PER_SYNC;
+				// The key changed or was removed: stop sending with the old one.
+				if (this.nextKey !== key) {return 'ok';}
 				const status = await this.deps.post(this.body(meta, chunk, finalize), key);
 
 				if (status >= 200 && status < 300) {
@@ -254,6 +265,7 @@ export class Recorder {
 export class KeyCache {
 	private key: string | undefined;
 	private isKnown = false;
+	private readFailed = false;
 	private version = 0;
 	private reads = 0;
 	private applied = 0;
@@ -267,6 +279,9 @@ export class KeyCache {
 
 	/** False until a read succeeded or a key was stored: "unknown", not "missing". */
 	get known(): boolean { return this.isKnown; }
+
+	/** The last read failed and no key has ever been known (keychain unreadable). */
+	get unreadable(): boolean { return !this.isKnown && this.readFailed; }
 
 	/** Stores a new key (Set API Key, connect link) and caches it. */
 	async store(key: string): Promise<void> {
@@ -287,7 +302,9 @@ export class KeyCache {
 				this.isKnown = true;
 				this.applied = ticket;
 			}
+			this.readFailed = false;
 		} catch {
+			this.readFailed = true;
 			// host shutting down or keychain unavailable: keep the last known key
 		}
 		return this.key;
