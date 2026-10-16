@@ -6,7 +6,7 @@ import * as path from 'path';
 import {
 	Recorder, State, SyncBody, QueuedEvent, WriteDeduper, IDLE_GAP_MS, MAX_EVENTS_PER_SYNC,
 	emptyState, mergeRecovered, isSensitiveName, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, importLegacy,
+	parseReflogCommit, readReflogSince, importLegacy, resolveKey,
 } from '../../core';
 
 const MIN = 60_000;
@@ -361,6 +361,32 @@ test('legacy 0.1.11 queue imports as one ended session with filtered names', asy
 	assert.ok(!JSON.stringify(p).includes('Client Co'), 'legacy project name never sent');
 	assert.equal(p.durationMinutes, 2);
 	assert.equal(importLegacy(h.rec.state, 'garbage', () => 'x'), 0);
+});
+
+test('resolveKey: a canceled SecretStorage read falls back to the cached key', async () => {
+	const canceled = () => Promise.reject(Object.assign(new Error('Canceled'), { name: 'Canceled' }));
+	assert.equal(await resolveKey(canceled, 'cached-key'), 'cached-key');
+	assert.equal(await resolveKey(canceled, undefined), undefined);
+	let called = false;
+	assert.equal(await resolveKey(null, 'cached-key'), 'cached-key', 'shutdown passes no reader');
+	assert.equal(await resolveKey(null, undefined), undefined);
+	assert.equal(await resolveKey(() => { called = true; return Promise.resolve('fresh'); }, 'old'), 'fresh');
+	assert.ok(called);
+	assert.equal(await resolveKey(() => Promise.resolve(undefined), 'old'), undefined, 'a removed key is honored');
+});
+
+test('regression: shutdown still finalizes when the key read is canceled (reload during smoke test)', async () => {
+	const h = harness();
+	for (let i = 0; i < 33; i++) {save(h.rec, `f${i}.ts`);} // 34 events with session_started
+	const sid = h.rec.state.current!;
+	h.rec.shutdown();
+	const key = await resolveKey(() => Promise.reject(new Error('Canceled')), 'key-read-at-activation');
+	assert.equal(await h.rec.sync(!!key), 'ok');
+	assert.equal(h.posts.length, 1);
+	assert.equal(h.posts[0].clientSessionId, sid);
+	assert.equal(h.posts[0].finalize, true);
+	assert.equal(h.posts[0].events.length, 35, '34 events plus session_ended, nothing dropped');
+	assert.equal(h.rec.state.queue.length, 0);
 });
 
 test('concurrent sync calls share one run (no double send)', async () => {

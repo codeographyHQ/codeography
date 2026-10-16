@@ -34,6 +34,9 @@ All notable changes to the "codeography" extension will be documented in this fi
   project folder name is no longer sent.
 - Error-count changes no longer keep a session alive on their own.
 - Requests time out after 15 seconds instead of hanging.
+- Fixed: closing or reloading VS Code skipped the final sync, because VS Code
+  cancels the API-key read while shutting down. Shutdown now uses the key already
+  in memory, so a session's last events and its finalize are sent right away.
 - The client-side `errorSummary` tally is no longer sent. The server builds
   evidence from stored events and ignores it, and its limits could reject
   uploads from very large workspaces.

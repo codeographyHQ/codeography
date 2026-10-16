@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, importLegacy,
+	parseReflogCommit, readReflogSince, importLegacy, resolveKey,
 } from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
@@ -159,9 +159,12 @@ async function post(body: SyncBody): Promise<number> {
 	}
 }
 
-async function syncNow() {
+// fresh=false (shutdown) uses the cached key: VS Code cancels SecretStorage
+// reads while the extension host shuts down, which used to abort the final sync.
+async function syncNow(fresh = true) {
 	if (!recorder || !secretStorage) {return;}
-	syncKey = await secretStorage.get(SECRET_KEY);
+	const store = secretStorage;
+	syncKey = await resolveKey(fresh ? () => store.get(SECRET_KEY) : null, syncKey);
 	hasKey = !!syncKey;
 	const result = await recorder.sync(hasKey);
 	if (result === 'ok') {syncProblem = null;}
@@ -177,7 +180,8 @@ async function syncNow() {
 	refreshStatusBar();
 }
 
-function keySaved() {
+function keySaved(key: string) {
+	syncKey = key;
 	hasKey = true;
 	syncProblem = null;
 	refreshStatusBar();
@@ -210,7 +214,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// configured user must not see a "set API key" warning while the key is
 	// still being read. Neutral until the keychain answers.
 	statusBar.text = '$(circle-outline) Codeography';
-	void secretStorage.get(SECRET_KEY).then(k => { hasKey = !!k; refreshStatusBar(); });
+	void resolveKey(() => context.secrets.get(SECRET_KEY), undefined).then(k => { syncKey = k; hasKey = !!k; refreshStatusBar(); });
 
 	// Command: Set API Key
 	const setKeyCommand = vscode.commands.registerCommand(
@@ -224,7 +228,7 @@ export function activate(context: vscode.ExtensionContext) {
 			if (key && secretStorage) {
 				await secretStorage.store(SECRET_KEY, key.trim());
 				vscode.window.showInformationMessage('Codeography: API key saved.');
-				keySaved();
+				keySaved(key.trim());
 			}
 		}
 	);
@@ -245,7 +249,7 @@ export function activate(context: vscode.ExtensionContext) {
 			if (secretStorage) {
 				secretStorage.store(SECRET_KEY, key).then(() => {
 					vscode.window.showInformationMessage('Codeography: Connected! Your session recording is now active.');
-					keySaved();
+					keySaved(key);
 				});
 			}
 		}
@@ -365,13 +369,18 @@ export async function deactivate() {
 	recorder?.shutdown();
 	flushPersist();
 
-	await Promise.race([
-		syncNow(),
-		new Promise<void>((resolve) => setTimeout(resolve, 3000)),
-	]);
-	flushPersist();
-	// A fully drained window leaves nothing to recover.
-	if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
-		try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
+	try {
+		await Promise.race([
+			syncNow(false),
+			new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+		]);
+	} catch (error) {
+		console.error('Codeography: shutdown sync failed; the queue is saved and is sent on the next start.', error);
+	} finally {
+		flushPersist();
+		// A fully drained window leaves nothing to recover.
+		if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
+			try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
+		}
 	}
 }

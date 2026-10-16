@@ -237,6 +237,21 @@ export class Recorder {
 	}
 }
 
+/**
+ * The API key to sync with. VS Code cancels SecretStorage IPC while the
+ * extension host shuts down (the read rejects with "Canceled"), so a failed
+ * read falls back to the key last read successfully instead of aborting the
+ * sync. Pass no reader to use the cached key without touching SecretStorage
+ * (shutdown). A read that succeeds with no key is honored: the key was removed.
+ */
+export async function resolveKey(
+	read: (() => PromiseLike<string | undefined>) | null,
+	cached: string | undefined,
+): Promise<string | undefined> {
+	if (!read) {return cached;}
+	try { return await read(); } catch { return cached; }
+}
+
 /** Merges recovered state (from a closed window) into `into`. Recovered sessions are ended. */
 export function mergeRecovered(into: State, recovered: State): void {
 	for (const s of Object.values(recovered.sessions ?? {})) {
