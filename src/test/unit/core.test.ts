@@ -6,7 +6,7 @@ import * as path from 'path';
 import {
 	Recorder, State, SyncBody, QueuedEvent, WriteDeduper, IDLE_GAP_MS, MAX_EVENTS_PER_SYNC,
 	emptyState, mergeRecovered, isSensitiveName, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, importLegacy, resolveKey,
+	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
 } from '../../core';
 
 const MIN = 60_000;
@@ -363,25 +363,42 @@ test('legacy 0.1.11 queue imports as one ended session with filtered names', asy
 	assert.equal(importLegacy(h.rec.state, 'garbage', () => 'x'), 0);
 });
 
-test('resolveKey: a canceled SecretStorage read falls back to the cached key', async () => {
-	const canceled = () => Promise.reject(Object.assign(new Error('Canceled'), { name: 'Canceled' }));
-	assert.equal(await resolveKey(canceled, 'cached-key'), 'cached-key');
-	assert.equal(await resolveKey(canceled, undefined), undefined);
-	let called = false;
-	assert.equal(await resolveKey(null, 'cached-key'), 'cached-key', 'shutdown passes no reader');
-	assert.equal(await resolveKey(null, undefined), undefined);
-	assert.equal(await resolveKey(() => { called = true; return Promise.resolve('fresh'); }, 'old'), 'fresh');
-	assert.ok(called);
-	assert.equal(await resolveKey(() => Promise.resolve(undefined), 'old'), undefined, 'a removed key is honored');
+const canceled = () => Promise.reject(Object.assign(new Error('Canceled'), { name: 'Canceled' }));
+
+test('KeyCache: a failed read keeps the last known key; a removed key is honored', async () => {
+	let stored: string | undefined = 'k1';
+	let fail = false;
+	const keys = new KeyCache(() => (fail ? canceled() : Promise.resolve(stored)));
+	assert.equal(await keys.refresh(), 'k1');
+	fail = true;
+	assert.equal(await keys.refresh(), 'k1', 'canceled read (host shutting down) keeps k1');
+	fail = false; stored = undefined;
+	assert.equal(await keys.refresh(), undefined, 'key removed in storage is honored');
+	const empty = new KeyCache(canceled);
+	assert.equal(await empty.refresh(), undefined, 'nothing cached and read failed: no key, nothing sent');
+});
+
+test('KeyCache: a read that started before a save cannot overwrite the saved key', async () => {
+	let release!: (v: string | undefined) => void;
+	const keys = new KeyCache(() => new Promise(r => { release = r; }));
+	const pending = keys.refresh();      // startup read in flight, storage still empty
+	keys.set('fresh-key');               // user connects from the dashboard
+	release(undefined);                  // stale read resolves afterwards
+	assert.equal(await pending, 'fresh-key');
+	assert.equal(keys.value, 'fresh-key');
 });
 
 test('regression: shutdown still finalizes when the key read is canceled (reload during smoke test)', async () => {
 	const h = harness();
+	let fail = false;
+	const keys = new KeyCache(() => (fail ? canceled() : Promise.resolve('key')));
+	await keys.refresh();                // key read while the window was running
 	for (let i = 0; i < 33; i++) {save(h.rec, `f${i}.ts`);} // 34 events with session_started
 	const sid = h.rec.state.current!;
 	h.rec.shutdown();
-	const key = await resolveKey(() => Promise.reject(new Error('Canceled')), 'key-read-at-activation');
-	assert.equal(await h.rec.sync(!!key), 'ok');
+	fail = true;                         // VS Code cancels SecretStorage IPC on shutdown
+	// the same path syncNow() takes: refresh, then sync
+	assert.equal(await h.rec.sync(!!(await keys.refresh())), 'ok');
 	assert.equal(h.posts.length, 1);
 	assert.equal(h.posts[0].clientSessionId, sid);
 	assert.equal(h.posts[0].finalize, true);

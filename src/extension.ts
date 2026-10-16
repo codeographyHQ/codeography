@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, importLegacy, resolveKey,
+	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
 } from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
@@ -24,7 +24,7 @@ let persistTimer: NodeJS.Timeout | null = null;
 let flushPendingWrites: (() => void) | null = null;
 // Cached so the status bar never needs a keychain read per event.
 let hasKey = false;
-let syncKey: string | undefined; // read once per sync, not per request
+let keys: KeyCache | null = null; // read once per sync, not per request
 let syncProblem: Extract<SyncResult, 'unauthorized' | 'rejected'> | null = null;
 
 // The status bar must tell the truth about state — not just that the
@@ -89,6 +89,14 @@ function flushPersist() {
 	if (recorder) {writeState(recorder.state);}
 }
 
+// Persist, or remove the file if this window has nothing left to send.
+function persistOrRemove() {
+	flushPersist();
+	if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
+		try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
+	}
+}
+
 function isAlive(pid: number): boolean {
 	try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
 }
@@ -143,7 +151,7 @@ function migrateLegacy(dir: string, into: State) {
 // ---------- network ----------
 
 async function post(body: SyncBody): Promise<number> {
-	const apiKey = syncKey;
+	const apiKey = keys?.value;
 	if (!apiKey) {return 401;}
 	try {
 		const response = await fetch(`${API_URL}/api/sessions`, {
@@ -159,13 +167,10 @@ async function post(body: SyncBody): Promise<number> {
 	}
 }
 
-// fresh=false (shutdown) uses the cached key: VS Code cancels SecretStorage
-// reads while the extension host shuts down, which used to abort the final sync.
-async function syncNow(fresh = true) {
-	if (!recorder || !secretStorage) {return;}
-	const store = secretStorage;
-	syncKey = await resolveKey(fresh ? () => store.get(SECRET_KEY) : null, syncKey);
-	hasKey = !!syncKey;
+async function syncNow() {
+	if (!recorder || !keys) {return;}
+	hasKey = !!(await keys.refresh());
+	refreshStatusBar();
 	const result = await recorder.sync(hasKey);
 	if (result === 'ok') {syncProblem = null;}
 	if (result === 'unauthorized') {
@@ -181,7 +186,7 @@ async function syncNow(fresh = true) {
 }
 
 function keySaved(key: string) {
-	syncKey = key;
+	keys?.set(key);
 	hasKey = true;
 	syncProblem = null;
 	refreshStatusBar();
@@ -214,7 +219,12 @@ export function activate(context: vscode.ExtensionContext) {
 	// configured user must not see a "set API key" warning while the key is
 	// still being read. Neutral until the keychain answers.
 	statusBar.text = '$(circle-outline) Codeography';
-	void resolveKey(() => context.secrets.get(SECRET_KEY), undefined).then(k => { syncKey = k; hasKey = !!k; refreshStatusBar(); });
+	keys = new KeyCache(() => context.secrets.get(SECRET_KEY));
+	// The key is read by the first syncNow() below. A key changed or removed in
+	// another window is picked up here, so shutdown never uses a stale key.
+	context.subscriptions.push(context.secrets.onDidChange(e => {
+		if (e.key === SECRET_KEY) {void keys?.refresh().then(k => { hasKey = !!k; refreshStatusBar(); });}
+	}));
 
 	// Command: Set API Key
 	const setKeyCommand = vscode.commands.registerCommand(
@@ -369,18 +379,19 @@ export async function deactivate() {
 	recorder?.shutdown();
 	flushPersist();
 
+	// The same key path as any sync: a canceled SecretStorage read keeps the
+	// key already in memory. If the cap wins and the sync lands later, persist
+	// again so the next start does not resend what was already accepted.
+	const finalSync = syncNow();
+	void finalSync.then(persistOrRemove, () => {});
 	try {
 		await Promise.race([
-			syncNow(false),
+			finalSync,
 			new Promise<void>((resolve) => setTimeout(resolve, 3000)),
 		]);
 	} catch (error) {
 		console.error('Codeography: shutdown sync failed; the queue is saved and is sent on the next start.', error);
 	} finally {
-		flushPersist();
-		// A fully drained window leaves nothing to recover.
-		if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
-			try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
-		}
+		persistOrRemove(); // a fully drained window leaves nothing to recover
 	}
 }

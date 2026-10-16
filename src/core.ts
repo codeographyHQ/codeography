@@ -238,18 +238,37 @@ export class Recorder {
 }
 
 /**
- * The API key to sync with. VS Code cancels SecretStorage IPC while the
- * extension host shuts down (the read rejects with "Canceled"), so a failed
- * read falls back to the key last read successfully instead of aborting the
- * sync. Pass no reader to use the cached key without touching SecretStorage
- * (shutdown). A read that succeeds with no key is honored: the key was removed.
+ * The single owner of the API key in memory. VS Code cancels SecretStorage
+ * IPC while the extension host shuts down (reads reject with "Canceled"), so
+ * a failed read keeps the last known key instead of aborting a sync. A read
+ * that succeeds with no key is honored (the key was removed). A read that
+ * started before set() was called cannot overwrite the newer key.
  */
-export async function resolveKey(
-	read: (() => PromiseLike<string | undefined>) | null,
-	cached: string | undefined,
-): Promise<string | undefined> {
-	if (!read) {return cached;}
-	try { return await read(); } catch { return cached; }
+export class KeyCache {
+	private key: string | undefined;
+	private version = 0;
+
+	constructor(private read: () => PromiseLike<string | undefined>) {}
+
+	get value(): string | undefined { return this.key; }
+
+	/** A key that was just stored (Set API Key, connect link). */
+	set(key: string | undefined): void {
+		this.key = key;
+		this.version++;
+	}
+
+	/** Re-reads storage; on failure keeps the last known key. */
+	async refresh(): Promise<string | undefined> {
+		const started = this.version;
+		try {
+			const key = await this.read();
+			if (this.version === started) {this.key = key;}
+		} catch {
+			// host shutting down or keychain unavailable: keep the last known key
+		}
+		return this.key;
+	}
 }
 
 /** Merges recovered state (from a closed window) into `into`. Recovered sessions are ended. */
