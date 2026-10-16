@@ -62,7 +62,7 @@ export interface Deps {
 	now(): number;
 	uuid(): string;
 	/** Resolves with the HTTP status, or 0 for network error / timeout. */
-	post(body: SyncBody): Promise<number>;
+	post(body: SyncBody, key: string): Promise<number>;
 	persist(state: State): void;
 }
 
@@ -79,6 +79,7 @@ export const emptyState = (): State => ({ version: 1, current: null, sessions: {
 export class Recorder {
 	private inFlight: Promise<SyncResult> | null = null;
 	private again = false;
+	private nextKey: string | undefined;
 	private closed = false;
 	/** Last workspace error count seen, used as the baseline of a new session. */
 	private knownErrorCount: number | null = null;
@@ -145,20 +146,26 @@ export class Recorder {
 	/**
 	 * One sync at a time. A call during a running sync joins it and forces one
 	 * more pass, so state changed meanwhile (e.g. a session ended on shutdown)
-	 * is not missed by the running pass's snapshot.
+	 * is not missed by the running pass's snapshot. Each pass uses one key from
+	 * start to finish, so a key change can never split a session's chunks.
 	 */
-	sync(hasKey: boolean): Promise<SyncResult> {
-		if (!hasKey) {return Promise.resolve('no-key');}
+	sync(key: string | undefined): Promise<SyncResult> {
+		if (!key) {return Promise.resolve('no-key');}
+		this.nextKey = key;
 		if (this.inFlight) { this.again = true; return this.inFlight; }
 		this.inFlight = (async () => {
+			// Yield first so this.inFlight is assigned before any work runs: a
+			// sync() call made during the first request then joins instead of
+			// starting a second, concurrent drain.
+			await Promise.resolve();
 			let result: SyncResult;
-			do { this.again = false; result = await this.drain(); } while (this.again && result === 'ok');
+			do { this.again = false; result = await this.drain(this.nextKey as string); } while (this.again && result === 'ok');
 			return result;
 		})().finally(() => { this.inFlight = null; });
 		return this.inFlight;
 	}
 
-	private async drain(): Promise<SyncResult> {
+	private async drain(key: string): Promise<SyncResult> {
 		let refused = false;
 		const ordered = Object.values(this.state.sessions)
 			.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
@@ -168,7 +175,7 @@ export class Recorder {
 				if (pending.length === 0 && !meta.ended) {break;}
 				const chunk = pending.slice(0, MAX_EVENTS_PER_SYNC);
 				const finalize = meta.ended && pending.length <= MAX_EVENTS_PER_SYNC;
-				const status = await this.deps.post(this.body(meta, chunk, finalize));
+				const status = await this.deps.post(this.body(meta, chunk, finalize), key);
 
 				if (status >= 200 && status < 300) {
 					this.remove(chunk);
@@ -241,29 +248,45 @@ export class Recorder {
  * The single owner of the API key in memory. VS Code cancels SecretStorage
  * IPC while the extension host shuts down (reads reject with "Canceled"), so
  * a failed read keeps the last known key instead of aborting a sync. A read
- * that succeeds with no key is honored (the key was removed). A read that
- * started before set() was called cannot overwrite the newer key.
+ * that succeeds with no key is honored (the key was removed). Only the newest
+ * read can apply, and a read that started before store() cannot overwrite it.
  */
 export class KeyCache {
 	private key: string | undefined;
+	private isKnown = false;
 	private version = 0;
+	private reads = 0;
+	private applied = 0;
 
-	constructor(private read: () => PromiseLike<string | undefined>) {}
+	constructor(
+		private read: () => PromiseLike<string | undefined>,
+		private write: (key: string) => PromiseLike<void>,
+	) {}
 
 	get value(): string | undefined { return this.key; }
 
-	/** A key that was just stored (Set API Key, connect link). */
-	set(key: string | undefined): void {
+	/** False until a read succeeded or a key was stored: "unknown", not "missing". */
+	get known(): boolean { return this.isKnown; }
+
+	/** Stores a new key (Set API Key, connect link) and caches it. */
+	async store(key: string): Promise<void> {
+		await this.write(key);
 		this.key = key;
+		this.isKnown = true;
 		this.version++;
 	}
 
 	/** Re-reads storage; on failure keeps the last known key. */
 	async refresh(): Promise<string | undefined> {
+		const ticket = ++this.reads;
 		const started = this.version;
 		try {
 			const key = await this.read();
-			if (this.version === started) {this.key = key;}
+			if (this.version === started && ticket > this.applied) {
+				this.key = key;
+				this.isKnown = true;
+				this.applied = ticket;
+			}
 		} catch {
 			// host shutting down or keychain unavailable: keep the last known key
 		}
