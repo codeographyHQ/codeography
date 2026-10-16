@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, importLegacy,
+	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
 } from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
@@ -15,7 +15,6 @@ const SECRET_KEY = 'codeography.apiKey';
 const STATE_PREFIX = 'state-';
 
 let recorder: Recorder | null = null;
-let secretStorage: vscode.SecretStorage | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
 let syncTimer: NodeJS.Timeout | null = null;
 let storageDir: string | null = null;
@@ -23,19 +22,34 @@ let stateFile: string | null = null;
 let persistTimer: NodeJS.Timeout | null = null;
 let flushPendingWrites: (() => void) | null = null;
 // Cached so the status bar never needs a keychain read per event.
-let hasKey = false;
-let syncKey: string | undefined; // read once per sync, not per request
+let keys: KeyCache | null = null; // read once per sync pass, not per request
+let closing = false;
 let syncProblem: Extract<SyncResult, 'unauthorized' | 'rejected'> | null = null;
 
 // The status bar must tell the truth about state — not just that the
 // extension exists. A missing/invalid key looks identical to a working
 // setup otherwise, and the user has no way to know nothing is syncing.
 function refreshStatusBar() {
-	if (!statusBar) {return;}
+	if (!statusBar || closing) {return;}
 
 	const warn = new vscode.ThemeColor('statusBarItem.warningBackground');
 
-	if (!hasKey) {
+	if (keys?.unreadable) {
+		statusBar.text = '$(warning) Codeography · can\'t read API key';
+		statusBar.tooltip = 'Codeography could not read its API key from the system keychain, so nothing is syncing. Events stay queued.';
+		statusBar.backgroundColor = warn;
+		return;
+	}
+
+	// Until the keychain has answered once, the key is unknown, not missing.
+	if (!keys?.known) {
+		statusBar.text = '$(circle-outline) Codeography';
+		statusBar.tooltip = 'Codeography is starting';
+		statusBar.backgroundColor = undefined;
+		return;
+	}
+
+	if (!keys.value) {
 		statusBar.text = '$(warning) Codeography · set API key';
 		statusBar.tooltip = 'Codeography needs an API key. Click to set it.';
 		statusBar.backgroundColor = warn;
@@ -87,6 +101,14 @@ function schedulePersist(state: State) {
 function flushPersist() {
 	if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
 	if (recorder) {writeState(recorder.state);}
+}
+
+// Persist, or remove the file if this window has nothing left to send.
+function persistOrRemove() {
+	flushPersist();
+	if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
+		try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
+	}
 }
 
 function isAlive(pid: number): boolean {
@@ -142,9 +164,7 @@ function migrateLegacy(dir: string, into: State) {
 
 // ---------- network ----------
 
-async function post(body: SyncBody): Promise<number> {
-	const apiKey = syncKey;
-	if (!apiKey) {return 401;}
+async function post(body: SyncBody, apiKey: string): Promise<number> {
 	try {
 		const response = await fetch(`${API_URL}/api/sessions`, {
 			method: 'POST',
@@ -160,10 +180,10 @@ async function post(body: SyncBody): Promise<number> {
 }
 
 async function syncNow() {
-	if (!recorder || !secretStorage) {return;}
-	syncKey = await secretStorage.get(SECRET_KEY);
-	hasKey = !!syncKey;
-	const result = await recorder.sync(hasKey);
+	if (!recorder || !keys) {return;}
+	const key = await keys.refresh();
+	refreshStatusBar();
+	const result = await recorder.sync(key);
 	if (result === 'ok') {syncProblem = null;}
 	if (result === 'unauthorized') {
 		syncProblem = 'unauthorized';
@@ -178,7 +198,6 @@ async function syncNow() {
 }
 
 function keySaved() {
-	hasKey = true;
 	syncProblem = null;
 	refreshStatusBar();
 	void syncNow();
@@ -186,7 +205,6 @@ function keySaved() {
 
 export function activate(context: vscode.ExtensionContext) {
 	storageDir = context.globalStorageUri.fsPath;
-	secretStorage = context.secrets;
 	fs.mkdirSync(storageDir, { recursive: true });
 	stateFile = path.join(storageDir, `${STATE_PREFIX}${randomUUID()}.json`);
 
@@ -210,7 +228,13 @@ export function activate(context: vscode.ExtensionContext) {
 	// configured user must not see a "set API key" warning while the key is
 	// still being read. Neutral until the keychain answers.
 	statusBar.text = '$(circle-outline) Codeography';
-	void secretStorage.get(SECRET_KEY).then(k => { hasKey = !!k; refreshStatusBar(); });
+	keys = new KeyCache(() => context.secrets.get(SECRET_KEY), (k) => context.secrets.store(SECRET_KEY, k));
+	// The key is read by the first syncNow() below. A key changed or removed in
+	// another window triggers a sync here, which re-reads it and clears a stale
+	// "sync failed" state, so shutdown never uses an outdated key.
+	context.subscriptions.push(context.secrets.onDidChange(e => {
+		if (e.key === SECRET_KEY) {void syncNow();}
+	}));
 
 	// Command: Set API Key
 	const setKeyCommand = vscode.commands.registerCommand(
@@ -221,8 +245,8 @@ export function activate(context: vscode.ExtensionContext) {
 				password: true,
 				placeHolder: 'cdg_live_...',
 			});
-			if (key && secretStorage) {
-				await secretStorage.store(SECRET_KEY, key.trim());
+			if (key && keys) {
+				await keys.store(key.trim());
 				vscode.window.showInformationMessage('Codeography: API key saved.');
 				keySaved();
 			}
@@ -242,8 +266,8 @@ export function activate(context: vscode.ExtensionContext) {
 				vscode.window.showErrorMessage('Codeography: Invalid connection link.');
 				return;
 			}
-			if (secretStorage) {
-				secretStorage.store(SECRET_KEY, key).then(() => {
+			if (keys) {
+				keys.store(key).then(() => {
 					vscode.window.showInformationMessage('Codeography: Connected! Your session recording is now active.');
 					keySaved();
 				});
@@ -357,6 +381,7 @@ export async function deactivate() {
 		statusBar.text = '$(circle-outline) Codeography';
 		statusBar.tooltip = 'Codeography session ended';
 	}
+	closing = true; // keep the status bar as it is from here on
 
 	// Record session_ended and mark the session for finalization, then
 	// persist BEFORE the network call: if the sync does not land within the
@@ -365,13 +390,20 @@ export async function deactivate() {
 	recorder?.shutdown();
 	flushPersist();
 
-	await Promise.race([
-		syncNow(),
-		new Promise<void>((resolve) => setTimeout(resolve, 3000)),
-	]);
-	flushPersist();
-	// A fully drained window leaves nothing to recover.
-	if (stateFile && recorder && recorder.state.queue.length === 0 && Object.keys(recorder.state.sessions).length === 0) {
-		try { fs.unlinkSync(stateFile); } catch { /* already gone */ }
+	// The same key path as any sync: a canceled SecretStorage read keeps the
+	// key already in memory. If the cap wins and the sync lands later, persist
+	// again so the next start does not resend what was already accepted.
+	let capped = false;
+	const finalSync = syncNow();
+	void finalSync.then(() => { if (capped) {persistOrRemove();} }, () => {});
+	try {
+		await Promise.race([
+			finalSync,
+			new Promise<void>((resolve) => setTimeout(() => { capped = true; resolve(); }, 3000)),
+		]);
+	} catch (error) {
+		console.error('Codeography: shutdown sync failed; the queue is saved and is sent on the next start.', error);
+	} finally {
+		persistOrRemove(); // a fully drained window leaves nothing to recover
 	}
 }
