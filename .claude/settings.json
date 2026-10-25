@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git merge:*)",
+      "Bash(git tag:*)",
+      "Bash(git reset:*)",
+      "Bash(git clean:*)",
+      "Bash(git restore:*)",
+      "Bash(git checkout --:*)",
+      "Bash(git stash drop:*)",
+      "Bash(git stash clear:*)",
+      "Bash(git branch -D:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh release:*)",
+      "Bash(vsce publish:*)",
+      "Bash(npx vsce publish:*)",
+      "Bash(npx @vscode/vsce publish:*)",
+      "Bash(npm publish:*)",
+      "Bash(rm -rf:*)",
+      "Read(**/.env*)",
+      "Read(**/.dev.vars)"
+    ]
+  }
+}
