@@ -16,8 +16,14 @@ All notable changes to the "codeography" extension will be documented in this fi
   upload, the events stay queued and the status bar says so.
 - Fixed: the queue saved to disk was never read back. It is now recovered
   after a crash or an offline shutdown, per window.
-- Unsent events left by 0.1.11 are imported once and its old queue files are
-  removed (they held unfiltered file names).
+- Unsent events left by 0.1.11 are imported once, from its newest queue file,
+  and that file is then removed (it held unfiltered file names). The import
+  works for any queue size, is claimed by one window only, and survives a
+  crash or restart without duplicating events: imported events get ids
+  derived from their content, so an interrupted import repeats as the same
+  events. Older daily files from 0.1.11 can hold either already-sent events
+  or unsent ones; they are kept locally as `legacy-retained-*.json` and not
+  uploaded.
 - A server refusal for one session no longer holds back other sessions.
 - Every event has a stable `clientEventId` so the backend can drop retries.
 - Git diff views and other non-file documents are no longer counted as files.

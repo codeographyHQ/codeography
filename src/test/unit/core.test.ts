@@ -354,7 +354,7 @@ test('legacy 0.1.11 queue imports as one ended session with filtered names', asy
 		{ type: 'file_saved', fileName: 'app.ts', language: 'typescript', timestamp: '2026-09-01T10:02:00.000Z' },
 		{ type: 'weird', timestamp: '2026-09-01T10:03:00.000Z' },
 		{ type: 'file_saved', timestamp: 'not a date' },
-	], () => `L${Math.random()}`);
+	]);
 	assert.equal(n, 3);
 	await h.rec.sync('key');
 	const p = h.posts[0];
@@ -362,7 +362,79 @@ test('legacy 0.1.11 queue imports as one ended session with filtered names', asy
 	assert.deepEqual(p.events.map(e => e.fileName), [undefined, undefined, 'app.ts'], 'secret name withheld, path stripped');
 	assert.ok(!JSON.stringify(p).includes('Client Co'), 'legacy project name never sent');
 	assert.equal(p.durationMinutes, 2);
-	assert.equal(importLegacy(h.rec.state, 'garbage', () => 'x'), 0);
+	assert.equal(importLegacy(h.rec.state, 'garbage'), 0);
+});
+
+// ---------- legacy import integrity (0.1.11 -> 0.1.12 upgrade) ----------
+
+const legacyQueue = (n: number, from = 0) => Array.from({ length: n }, (_, k) => {
+	const i = k + from;
+	return { type: i % 3 ? 'file_saved' : 'file_changed_externally', project: 'p', fileName: `/w/src/f${i % 40}.ts`, language: 'typescript',
+		timestamp: new Date(Date.UTC(2026, 9, 25, 12) + i * 10).toISOString() };
+});
+// The backend's uuid check (zod 4): version 1-8, RFC variant.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test('legacy import handles a 300,000-event queue (no argument-spread limits)', () => {
+	const state = emptyState();
+	assert.equal(importLegacy(state, legacyQueue(300_000)), 300_000);
+	const [s] = Object.values(state.sessions);
+	assert.equal(Object.keys(state.sessions).length, 1);
+	assert.equal(s.startedAt, '2026-10-25T12:00:00.000Z');
+	assert.equal(s.lastActivityAt, Date.UTC(2026, 9, 25, 12) + 299_999 * 10);
+	assert.ok(s.ended);
+	assert.equal(new Set(state.queue.map(e => e.clientEventId)).size, 300_000);
+	assert.ok(state.queue.every(e => e.sid === s.id && UUID.test(e.clientEventId)) && UUID.test(s.id));
+});
+
+test('legacy import ids are derived from the events: re-imports add nothing and match exactly', () => {
+	const a = emptyState(), b = emptyState();
+	importLegacy(a, legacyQueue(7000));
+	assert.equal(importLegacy(a, legacyQueue(7000)), 0, 'same file again (interrupted import, second window)');
+	assert.equal(a.queue.length, 7000);
+	importLegacy(b, legacyQueue(7000));
+	assert.deepEqual(b.queue, a.queue, 'another window derives the same session and event ids');
+	assert.deepEqual(b.sessions, a.sessions);
+});
+
+test('a later snapshot of the same 0.1.11 queue adds only its new events, to the same session', () => {
+	const state = emptyState();
+	importLegacy(state, legacyQueue(1000));
+	assert.equal(importLegacy(state, legacyQueue(1500)), 500);
+	assert.equal(Object.keys(state.sessions).length, 1);
+	assert.equal(new Set(state.queue.map(e => e.clientEventId)).size, 1500);
+	assert.equal(Object.values(state.sessions)[0].lastActivityAt, Date.UTC(2026, 9, 25, 12) + 1499 * 10);
+});
+
+test('identical legacy events stay distinct events', () => {
+	const e = { type: 'file_saved', fileName: 'a.ts', language: 'typescript', timestamp: '2026-10-25T12:00:00.000Z' };
+	const state = emptyState();
+	assert.equal(importLegacy(state, [e, e, e]), 3);
+	assert.equal(new Set(state.queue.map(q => q.clientEventId)).size, 3);
+	assert.equal(importLegacy(state, [e, e, e]), 0);
+});
+
+test('a legacy import that fails midway leaves no events or sessions behind', () => {
+	const state = emptyState();
+	importLegacy(state, legacyQueue(10, 5000)); // something already queued
+	const before = JSON.stringify(state);
+	// A valid-looking entry whose file name cannot be read: the import fails
+	// after it has already processed 50,000 events.
+	const poison = { type: 'file_saved', timestamp: '2026-10-25T13:00:00.000Z', get fileName(): string { throw new Error('unreadable entry'); } };
+	const poisoned = [...legacyQueue(50_000), poison, ...legacyQueue(10, 60_000)];
+	assert.throws(() => importLegacy(state, poisoned), /unreadable entry/);
+	assert.equal(JSON.stringify(state), before);
+});
+
+test('importing again after a crash that saved the import does not duplicate it', () => {
+	const crashed = emptyState();
+	importLegacy(crashed, legacyQueue(2000));
+	const onDisk = JSON.parse(JSON.stringify(crashed)) as State; // state file written, legacy file not yet removed
+	const next = emptyState();
+	mergeRecovered(next, onDisk);
+	assert.equal(importLegacy(next, legacyQueue(2000)), 0);
+	assert.equal(next.queue.length, 2000);
+	assert.equal(Object.keys(next.sessions).length, 1);
 });
 
 const canceled = () => Promise.reject(Object.assign(new Error('Canceled'), { name: 'Canceled' }));

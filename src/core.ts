@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 
 // Session recording and sync, kept free of the `vscode` module so it can be
 // unit-tested with plain Node. extension.ts wires VS Code events into this.
@@ -335,32 +336,65 @@ export function mergeRecovered(into: State, recovered: State): void {
 const EVENT_TYPES = new Set(['session_started', 'session_ended', 'file_opened', 'file_saved',
 	'file_changed_externally', 'error_count_changed', 'git_commit_created']);
 
+/** A UUID-shaped id (version 8, RFC 9562 variant) derived from `key`. */
+function derivedId(key: string): string {
+	const h = createHash('sha256').update(key).digest('hex');
+	const variant = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-8${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
 /**
  * Imports an event array persisted by extension <= 0.1.11 (no session or
  * event ids) as one ended session. Only known fields are kept and file names
- * pass the same filter as new events. Returns the number of events imported.
+ * pass the same filter as new events. Returns the number of events added.
+ *
+ * Ids are derived from the events themselves, so importing the same queue
+ * again (an interrupted import, two windows, a 0.1.11 window that kept
+ * appending to the file) yields the same session and event ids: repeats are
+ * skipped here and deduplicated by the backend. 0.1.11 only appended to its
+ * queue until a sync emptied it, so its first event identifies the queue.
+ * Nothing is added to `into` until the whole import has been built.
  */
-export function importLegacy(into: State, events: unknown, uuid: () => string): number {
+export function importLegacy(into: State, events: unknown): number {
 	if (!Array.isArray(events)) {return 0;}
-	const valid = events.filter((e): e is Record<string, unknown> =>
-		!!e && typeof e === 'object' && EVENT_TYPES.has(String((e as Record<string, unknown>).type))
-		&& !Number.isNaN(Date.parse(String((e as Record<string, unknown>).timestamp))));
-	if (valid.length === 0) {return 0;}
-	const sid = uuid();
-	for (const e of valid) {
-		into.queue.push({
-			clientEventId: uuid(), sid, type: String(e.type), timestamp: new Date(String(e.timestamp)).toISOString(),
+	const parsed: QueuedEvent[] = [];
+	const seen = new Map<string, number>();
+	let first = Infinity, last = -Infinity, sid = '';
+	for (const raw of events) {
+		if (!raw || typeof raw !== 'object') {continue;}
+		const e = raw as Record<string, unknown>;
+		const t = Date.parse(String(e.timestamp));
+		if (!EVENT_TYPES.has(String(e.type)) || Number.isNaN(t)) {continue;}
+		const ev: Omit<QueuedEvent, 'clientEventId' | 'sid'> = {
+			type: String(e.type), timestamp: new Date(t).toISOString(),
 			...(typeof e.fileName === 'string' ? { fileName: reportableName(e.fileName) } : {}),
 			...(typeof e.language === 'string' ? { language: e.language } : {}),
 			...(typeof e.errorCount === 'number' ? { errorCount: e.errorCount } : {}),
-		});
+		};
+		const key = JSON.stringify([ev.type, ev.timestamp, ev.fileName ?? null, ev.language ?? null, ev.errorCount ?? null]);
+		const nth = (seen.get(key) ?? 0) + 1;   // identical events stay distinct
+		seen.set(key, nth);
+		if (!sid) {sid = derivedId(`codeography-legacy-session:${key}`);}
+		parsed.push({ ...ev, clientEventId: derivedId(`codeography-legacy-event:${sid}:${key}:${nth}`), sid });
+		if (t < first) {first = t;}
+		if (t > last) {last = t;}
 	}
-	const times = valid.map(e => Date.parse(String(e.timestamp)));
+	if (parsed.length === 0) {return 0;}
+
+	const have = new Set(into.queue.map(e => e.clientEventId));
+	let added = 0;
+	for (const e of parsed) {
+		if (have.has(e.clientEventId)) {continue;}
+		into.queue.push(e);
+		added++;
+	}
+	const known = into.sessions[sid];
 	into.sessions[sid] = {
-		id: sid, startedAt: new Date(Math.min(...times)).toISOString(), lastActivityAt: Math.max(...times),
-		ended: true, lastErrorCount: 0,
+		id: sid, ended: true, lastErrorCount: 0,
+		startedAt: new Date(known ? Math.min(first, Date.parse(known.startedAt)) : first).toISOString(),
+		lastActivityAt: known ? Math.max(last, known.lastActivityAt) : last,
 	};
-	return valid.length;
+	return added;
 }
 
 // ---------- commits ----------

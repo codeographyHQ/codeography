@@ -141,25 +141,58 @@ function recoverOrphans(dir: string, into: State) {
 	}
 }
 
-// Extension <= 0.1.11 kept its queue in codeography-YYYY-MM-DD.json. A
-// successful sync rewrote the current day's file as [], so only the newest
-// file can hold unsent events; older days are stale copies of sent events.
-// Import the newest as one ended session, then delete them all: they also
-// hold file names that were never filtered.
-function migrateLegacy(dir: string, into: State) {
-	const files = fs.readdirSync(dir).filter(n => /^codeography-\d{4}-\d{2}-\d{2}\.json$/.test(n)).sort();
-	if (files.length === 0) {return;}
+// Extension <= 0.1.11 kept its in-memory queue in codeography-YYYY-MM-DD.json,
+// rewritten on every event. The newest file holds the latest unsent queue and
+// is imported as one ended session. An older day's file is either a stale copy
+// of events that were sent later or the queue of a window that quit without
+// sending it; nothing tells the two apart, so it is kept (renamed so it is not
+// imported) instead of uploaded or deleted.
+//
+// The newest file is claimed by an atomic rename before it is read, so two
+// windows starting together cannot both import it. A claim whose window died
+// before the import was saved is taken over on the next start; importLegacy's
+// derived ids make importing it again safe.
+const LEGACY = /^codeography-\d{4}-\d{2}-\d{2}\.json$/;
+const LEGACY_CLAIMED = /^legacy-claimed-(\d+)-(codeography-\d{4}-\d{2}-\d{2}\.json)$/;
+
+function retainLegacy(dir: string, name: string) {
+	let target = path.join(dir, `legacy-retained-${name}`);
+	for (let i = 1; fs.existsSync(target); i++) {target = path.join(dir, `legacy-retained-${i}-${name}`);}
+	try { fs.renameSync(path.join(dir, name), target); } catch { /* another window moved it */ }
+}
+
+function importClaimed(dir: string, claimed: string, into: State) {
+	const file = path.join(dir, claimed);
 	try {
-		const n = importLegacy(into, JSON.parse(fs.readFileSync(path.join(dir, files[files.length - 1]), 'utf8')), randomUUID);
+		const n = importLegacy(into, JSON.parse(fs.readFileSync(file, 'utf8')));
 		writeState(into);
+		fs.unlinkSync(file);
 		console.log(`Codeography: migrated ${n} unsent events from an older version.`);
 	} catch (error) {
-		console.error('Codeography: could not read the old queue file; leaving it in place.', error);
-		return;
+		console.error('Codeography: could not import the old queue file; it is kept and retried on the next start.', error);
 	}
-	for (const f of files) {
-		try { fs.unlinkSync(path.join(dir, f)); } catch { /* already gone */ }
+}
+
+function migrateLegacy(dir: string, into: State) {
+	const names = fs.readdirSync(dir);
+	for (const name of names) {
+		const m = LEGACY_CLAIMED.exec(name);
+		if (!m) {continue;}
+		const owner = Number(m[1]);
+		if (owner !== process.pid && isAlive(owner)) {continue;}
+		const mine = `legacy-claimed-${process.pid}-${m[2]}`;
+		try { if (name !== mine) {fs.renameSync(path.join(dir, name), path.join(dir, mine));} } catch { continue; }
+		importClaimed(dir, mine, into);
 	}
+
+	const files = names.filter(n => LEGACY.test(n)).sort();
+	if (files.length === 0) {return;}
+	const newest = files[files.length - 1];
+	// Older days first: if this window dies midway, the newest is still newest.
+	for (const f of files.slice(0, -1)) {retainLegacy(dir, f);}
+	const claimed = `legacy-claimed-${process.pid}-${newest}`;
+	try { fs.renameSync(path.join(dir, newest), path.join(dir, claimed)); } catch { return; } // another window has it
+	importClaimed(dir, claimed, into);
 }
 
 // ---------- network ----------
