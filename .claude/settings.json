@@ -7,7 +7,6 @@
       "Bash(git reset:*)",
       "Bash(git clean:*)",
       "Bash(git restore:*)",
-      "Bash(git checkout --:*)",
       "Bash(git stash drop:*)",
       "Bash(git stash clear:*)",
       "Bash(git branch -D:*)",
@@ -17,9 +16,21 @@
       "Bash(npx vsce publish:*)",
       "Bash(npx @vscode/vsce publish:*)",
       "Bash(npm publish:*)",
-      "Bash(rm -rf:*)",
       "Read(**/.env*)",
-      "Read(**/.dev.vars)"
+      "Read(**/.dev.vars)",
+      "Bash(rm:*)",
+      "Bash(unlink:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git rm:*)",
+      "Bash(git branch -d:*)",
+      "Bash(git branch --delete:*)",
+      "Bash(git stash pop:*)",
+      "Bash(git stash apply:*)",
+      "Bash(git stash push:*)",
+      "Bash(git stash save:*)",
+      "Bash(npx --yes @vscode/vsce@3 publish:*)",
+      "Bash(npx @vscode/vsce@3 publish:*)"
     ]
   }
 }

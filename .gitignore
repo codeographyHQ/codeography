@@ -3,3 +3,6 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+
+# Local assistant handoff notes (see AGENTS.md); anchored to the repo root
+/.handoff/
