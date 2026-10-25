@@ -66,6 +66,16 @@ Every finalized session becomes a story on your public profile, a living portfol
 
 ## Running it locally
 
+Development requires Node.js 20.9+ on the 20.x line, or Node.js 22+; Node.js 21
+is excluded by the development dependencies. Node.js 20 and 24 are validated.
+This is a development-tool requirement; the extension runs inside VS Code's
+bundled runtime.
+
+Mocha's `diff` and `serialize-javascript` dependencies have narrowly scoped
+security overrides in `package.json`. Keep these until Mocha supports patched
+versions directly; validate its parallel runner and assertion-diff reporters
+when changing them.
+
 ```
 git clone https://github.com/codeographyHQ/codeography.git
 cd codeography
