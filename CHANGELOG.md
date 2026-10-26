@@ -2,7 +2,7 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
-## [Unreleased]
+## [0.1.12]
 
 - Fixed: an idle session could be finalized under the next session's id,
   after which every sync created a separate session. Each event now carries
@@ -16,8 +16,11 @@ All notable changes to the "codeography" extension will be documented in this fi
   upload, the events stay queued and the status bar says so.
 - Fixed: the queue saved to disk was never read back. It is now recovered
   after a crash or an offline shutdown, per window.
-- Unsent events left by 0.1.11 are imported once and its old queue files are
-  removed (they held unfiltered file names).
+- Unsent events left by 0.1.11 are imported with filtered file names, split
+  into sessions at its session starts and idle gaps. Import ids are derived
+  from the old file, so an interrupted or repeated import never queues or
+  uploads an event twice, and large queues (300,000+ events) import without
+  crashing. The old queue files are left in place.
 - A server refusal for one session no longer holds back other sessions.
 - Every event has a stable `clientEventId` so the backend can drop retries.
 - Git diff views and other non-file documents are no longer counted as files.

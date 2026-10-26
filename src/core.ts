@@ -1,4 +1,6 @@
 import * as fs from 'fs';
+import * as path from 'path';
+import { createHash } from 'crypto';
 
 // Session recording and sync, kept free of the `vscode` module so it can be
 // unit-tested with plain Node. extension.ts wires VS Code events into this.
@@ -335,32 +337,171 @@ export function mergeRecovered(into: State, recovered: State): void {
 const EVENT_TYPES = new Set(['session_started', 'session_ended', 'file_opened', 'file_saved',
 	'file_changed_externally', 'error_count_changed', 'git_commit_created']);
 
+// Namespace for ids derived from 0.1.11 queue files. Fixed forever: changing
+// it would give an already-imported backlog new ids, which the backend cannot
+// recognise as duplicates.
+const LEGACY_NAMESPACE = '6f1c2a4e-5b0d-4c8e-9a37-2d4b8e1f0c53';
+
+/** RFC 9562 UUIDv5 (SHA-1, name-based): the same name always yields the same id. */
+export function uuidV5(namespace: string, name: string): string {
+	const h = createHash('sha1').update(Buffer.from(namespace.replace(/-/g, ''), 'hex')).update(name, 'utf8').digest();
+	h[6] = (h[6] & 0x0f) | 0x50;
+	h[8] = (h[8] & 0x3f) | 0x80;
+	const x = h.subarray(0, 16).toString('hex');
+	return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20)}`;
+}
+
 /**
  * Imports an event array persisted by extension <= 0.1.11 (no session or
- * event ids) as one ended session. Only known fields are kept and file names
- * pass the same filter as new events. Returns the number of events imported.
+ * event ids). `source` is the legacy file's name.
+ *
+ * Sessions: 0.1.11 kept one queue per extension host and wrote
+ * session_started when the host started and after every idle gap over
+ * IDLE_GAP_MS. After a successful finalize it recorded on without a marker,
+ * so a gap over IDLE_GAP_MS also starts a session. Order is kept as in the
+ * file.
+ *
+ * Ids are derived from (source, position, sanitised event), so importing the
+ * same file again yields the same ids: events already queued are skipped here
+ * and events already delivered are dropped by the backend. Files with other
+ * names or contents get other ids. Nothing is added to `into` until the whole
+ * array has been processed.
+ *
+ * Only known fields are kept and file names pass the same filter as new
+ * events. Returns the number of events added to the queue.
  */
-export function importLegacy(into: State, events: unknown, uuid: () => string): number {
+export function importLegacy(into: State, events: unknown, source: string): number {
 	if (!Array.isArray(events)) {return 0;}
-	const valid = events.filter((e): e is Record<string, unknown> =>
-		!!e && typeof e === 'object' && EVENT_TYPES.has(String((e as Record<string, unknown>).type))
-		&& !Number.isNaN(Date.parse(String((e as Record<string, unknown>).timestamp))));
-	if (valid.length === 0) {return 0;}
-	const sid = uuid();
-	for (const e of valid) {
-		into.queue.push({
-			clientEventId: uuid(), sid, type: String(e.type), timestamp: new Date(String(e.timestamp)).toISOString(),
+	const sessions: SessionMeta[] = [];
+	const queued: QueuedEvent[] = [];
+	let meta: SessionMeta | null = null;
+	let startMs = 0, prevMs = 0;
+	for (let i = 0; i < events.length; i++) {
+		const e = events[i] as Record<string, unknown> | null;
+		if (!e || typeof e !== 'object' || !EVENT_TYPES.has(String(e.type))) {continue;}
+		const t = Date.parse(String(e.timestamp));
+		if (Number.isNaN(t)) {continue;}
+		const fields = {
+			type: String(e.type), timestamp: new Date(t).toISOString(),
 			...(typeof e.fileName === 'string' ? { fileName: reportableName(e.fileName) } : {}),
 			...(typeof e.language === 'string' ? { language: e.language } : {}),
 			...(typeof e.errorCount === 'number' ? { errorCount: e.errorCount } : {}),
-		});
+		};
+		// Hashes only what is sent, so the id reveals nothing the filter withheld.
+		const clientEventId = uuidV5(LEGACY_NAMESPACE, JSON.stringify([source, i, fields]));
+		if (!meta || fields.type === 'session_started' || t - prevMs > IDLE_GAP_MS) {
+			meta = {
+				id: uuidV5(LEGACY_NAMESPACE, `session:${clientEventId}`), startedAt: fields.timestamp,
+				lastActivityAt: t, ended: true, lastErrorCount: 0,
+			};
+			sessions.push(meta);
+			startMs = t;
+		}
+		if (t < startMs) { startMs = t; meta.startedAt = fields.timestamp; }
+		if (t > meta.lastActivityAt) {meta.lastActivityAt = t;}
+		queued.push({ clientEventId, sid: meta.id, ...fields });
+		prevMs = t;
 	}
-	const times = valid.map(e => Date.parse(String(e.timestamp)));
-	into.sessions[sid] = {
-		id: sid, startedAt: new Date(Math.min(...times)).toISOString(), lastActivityAt: Math.max(...times),
-		ended: true, lastErrorCount: 0,
+	for (const s of sessions) {
+		const have = into.sessions[s.id];
+		if (!have) { into.sessions[s.id] = s; continue; }
+		// The same session from a file that grew since: widen its time bounds.
+		if (Date.parse(s.startedAt) < Date.parse(have.startedAt)) {have.startedAt = s.startedAt;}
+		if (s.lastActivityAt > have.lastActivityAt) {have.lastActivityAt = s.lastActivityAt;}
+	}
+	const have = new Set(into.queue.map(e => e.clientEventId));
+	let added = 0;
+	for (const e of queued) {
+		if (have.has(e.clientEventId)) {continue;}
+		into.queue.push(e);
+		added++;
+	}
+	return added;
+}
+
+// ---------- 0.1.11 migration ----------
+
+export const LEGACY_FILE = /^codeography-\d{4}-\d{2}-\d{2}\.json$/;
+/** Records which legacy file contents have been imported and durably persisted. */
+export const LEGACY_MARKER = 'legacy-migrated.json';
+
+export interface MigrationIo {
+	/** Durably persists the state. False when it could not be written. */
+	persist(state: State): boolean;
+	/** Durably replaces a whole file. Throws on failure. */
+	writeFile(file: string, data: string): void;
+}
+
+export type MigrationResult =
+	| { status: 'none' | 'already-migrated' }
+	| { status: 'unreadable' | 'not-persisted' | 'not-marked'; error?: unknown; events?: number }
+	| { status: 'migrated'; events: number };
+
+/**
+ * Imports the newest 0.1.11 queue file into `into`. A successful sync in
+ * 0.1.11 rewrote the current day's file as [], so older files are copies of
+ * events that may already have been sent; they are not imported.
+ *
+ * Legacy files are never modified or deleted. The marker is written only
+ * after the imported state has been persisted, so a crash at any point
+ * leaves either no trace (the next start imports again) or a persisted state
+ * without a marker (the next start recovers that state, then imports again:
+ * the same ids, so nothing is queued twice).
+ */
+export function migrateLegacy(dir: string, into: State, io: MigrationIo): MigrationResult {
+	let files: string[];
+	try { files = fs.readdirSync(dir).filter(n => LEGACY_FILE.test(n)).sort(); } catch (error) { return { status: 'unreadable', error }; }
+	if (files.length === 0) {return { status: 'none' };}
+	const name = files[files.length - 1];
+	let digest: string, events: unknown;
+	try {
+		const bytes = fs.readFileSync(path.join(dir, name));
+		digest = createHash('sha256').update(bytes).digest('hex');
+		if (readMarker(dir)[name] === digest) {return { status: 'already-migrated' };}
+		events = JSON.parse(bytes.toString('utf8'));
+	} catch (error) {
+		return { status: 'unreadable', error };
+	}
+	const added = importLegacy(into, events, name);
+	if (!io.persist(into)) {return { status: 'not-persisted', events: added };}
+	try {
+		io.writeFile(path.join(dir, LEGACY_MARKER), JSON.stringify({ ...readMarker(dir), [name]: digest }));
+	} catch (error) {
+		return { status: 'not-marked', error, events: added };
+	}
+	return { status: 'migrated', events: added };
+}
+
+function readMarker(dir: string): Record<string, string> {
+	try {
+		const m = JSON.parse(fs.readFileSync(path.join(dir, LEGACY_MARKER), 'utf8'));
+		return m && typeof m === 'object' && !Array.isArray(m) ? m : {};
+	} catch {
+		return {};
+	}
+}
+
+const DIR_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR', 'EBADF']);
+
+/** Writes `data` to a temp file, flushes it to disk, then renames it over `file`. */
+export function writeFileDurable(file: string, data: string): void {
+	const tmp = `${file}.tmp`;
+	const fd = fs.openSync(tmp, 'w', 0o600);
+	try {
+		fs.writeFileSync(fd, data);
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+	fs.renameSync(tmp, file);
+	// Opening or flushing a directory is unsupported on some platforms (Windows)
+	// and file systems; any other error is a real I/O failure and is thrown.
+	const unsupported = (error: unknown) => {
+		if (!DIR_SYNC_UNSUPPORTED.has((error as NodeJS.ErrnoException).code ?? '')) {throw error;}
 	};
-	return valid.length;
+	let dirFd: number;
+	try { dirFd = fs.openSync(path.dirname(file), 'r'); } catch (error) { unsupported(error); return; }
+	try { fs.fsyncSync(dirFd); } catch (error) { unsupported(error); } finally { fs.closeSync(dirFd); }
 }
 
 // ---------- commits ----------

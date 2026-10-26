@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
+	parseReflogCommit, readReflogSince, migrateLegacy, writeFileDurable, KeyCache,
 } from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
@@ -80,14 +80,21 @@ function refreshStatusBar() {
 
 // ---------- persistence (one file per window, recovered after a crash) ----------
 
-function writeState(state: State) {
-	if (!stateFile) {return;}
+// `durable` also flushes the file to disk before reporting success.
+function writeState(state: State, durable = false): boolean {
+	if (!stateFile) {return false;}
 	try {
-		const tmp = `${stateFile}.tmp`;
-		fs.writeFileSync(tmp, JSON.stringify({ ...state, ownerPid: process.pid }));
-		fs.renameSync(tmp, stateFile);
+		const data = JSON.stringify({ ...state, ownerPid: process.pid });
+		if (durable) {writeFileDurable(stateFile, data);}
+		else {
+			const tmp = `${stateFile}.tmp`;
+			fs.writeFileSync(tmp, data);
+			fs.renameSync(tmp, stateFile);
+		}
+		return true;
 	} catch (error) {
 		console.error('Codeography: failed to persist queue:', error);
+		return false;
 	}
 }
 
@@ -133,33 +140,24 @@ function recoverOrphans(dir: string, into: State) {
 			const claimed = path.join(dir, `${STATE_PREFIX}claimed-${process.pid}-${name.slice(STATE_PREFIX.length)}`);
 			fs.renameSync(file, claimed);
 			mergeRecovered(into, JSON.parse(fs.readFileSync(claimed, 'utf8')));
-			writeState(into);
-			fs.unlinkSync(claimed);
+			// Remove the claimed file only once its events are durably in ours;
+			// otherwise it stays recoverable (ids de-duplicate a later merge).
+			if (writeState(into, true)) {fs.unlinkSync(claimed);}
 		} catch (error) {
 			console.error('Codeography: could not recover', name, error);
 		}
 	}
 }
 
-// Extension <= 0.1.11 kept its queue in codeography-YYYY-MM-DD.json. A
-// successful sync rewrote the current day's file as [], so only the newest
-// file can hold unsent events; older days are stale copies of sent events.
-// Import the newest as one ended session, then delete them all: they also
-// hold file names that were never filtered.
-function migrateLegacy(dir: string, into: State) {
-	const files = fs.readdirSync(dir).filter(n => /^codeography-\d{4}-\d{2}-\d{2}\.json$/.test(n)).sort();
-	if (files.length === 0) {return;}
-	try {
-		const n = importLegacy(into, JSON.parse(fs.readFileSync(path.join(dir, files[files.length - 1]), 'utf8')), randomUUID);
-		writeState(into);
-		console.log(`Codeography: migrated ${n} unsent events from an older version.`);
-	} catch (error) {
-		console.error('Codeography: could not read the old queue file; leaving it in place.', error);
-		return;
-	}
-	for (const f of files) {
-		try { fs.unlinkSync(path.join(dir, f)); } catch { /* already gone */ }
-	}
+// Extension <= 0.1.11 kept its queue in codeography-YYYY-MM-DD.json. The
+// newest file is imported (see migrateLegacy in core) and the files are left
+// in place.
+function migrateLegacyQueue(dir: string, into: State) {
+	const r = migrateLegacy(dir, into, { persist: s => writeState(s, true), writeFile: writeFileDurable });
+	if (r.status === 'migrated') {console.log(`Codeography: migrated ${r.events} unsent events from an older version.`);}
+	if (r.status === 'unreadable') {console.error('Codeography: could not read the old queue file; leaving it in place.', r.error);}
+	if (r.status === 'not-persisted') {console.error('Codeography: could not save the migrated queue; it will be imported again next start.');}
+	if (r.status === 'not-marked') {console.error('Codeography: could not record the migration; it will be imported again next start.', r.error);}
 }
 
 // ---------- network ----------
@@ -216,7 +214,7 @@ export function activate(context: vscode.ExtensionContext) {
 		persist: schedulePersist,
 	});
 	recoverOrphans(storageDir, state);
-	migrateLegacy(storageDir, state);
+	migrateLegacyQueue(storageDir, state);
 
 	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusBar.command = 'codeography.setApiKey';

@@ -7,6 +7,7 @@ import {
 	Recorder, State, SyncBody, QueuedEvent, WriteDeduper, IDLE_GAP_MS, MAX_EVENTS_PER_SYNC,
 	emptyState, mergeRecovered, isSensitiveName, reportableName, isGeneratedPath, languageForPath,
 	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
+	uuidV5, migrateLegacy, writeFileDurable, LEGACY_MARKER, MigrationIo,
 } from '../../core';
 
 const MIN = 60_000;
@@ -354,7 +355,7 @@ test('legacy 0.1.11 queue imports as one ended session with filtered names', asy
 		{ type: 'file_saved', fileName: 'app.ts', language: 'typescript', timestamp: '2026-09-01T10:02:00.000Z' },
 		{ type: 'weird', timestamp: '2026-09-01T10:03:00.000Z' },
 		{ type: 'file_saved', timestamp: 'not a date' },
-	], () => `L${Math.random()}`);
+	], 'codeography-2026-09-01.json');
 	assert.equal(n, 3);
 	await h.rec.sync('key');
 	const p = h.posts[0];
@@ -362,7 +363,7 @@ test('legacy 0.1.11 queue imports as one ended session with filtered names', asy
 	assert.deepEqual(p.events.map(e => e.fileName), [undefined, undefined, 'app.ts'], 'secret name withheld, path stripped');
 	assert.ok(!JSON.stringify(p).includes('Client Co'), 'legacy project name never sent');
 	assert.equal(p.durationMinutes, 2);
-	assert.equal(importLegacy(h.rec.state, 'garbage', () => 'x'), 0);
+	assert.equal(importLegacy(h.rec.state, 'garbage', 'codeography-2026-09-01.json'), 0);
 });
 
 const canceled = () => Promise.reject(Object.assign(new Error('Canceled'), { name: 'Canceled' }));
@@ -624,5 +625,328 @@ test('reflog: reads every line appended since the last offset; rewritten log is 
 	const p2 = readReflogSince(file, p1.size);
 	assert.deepEqual(p2.lines.map(parseReflogCommit), [{ sha: B }], 'whole line read once complete');
 	assert.deepEqual(readReflogSince(path.join(dir, 'missing'), 10), { lines: [], size: 10 });
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------- 0.1.11 legacy migration ----------
+
+const LEGACY = 'codeography-2026-09-01.json';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const T0 = Date.parse('2026-09-01T09:00:00Z');
+
+/** A 0.1.11-shaped queue: session_started every `perSession` events, 1 s apart, 20 min between sessions. */
+function legacyQueue(count: number, perSession = count) {
+	const out: Record<string, unknown>[] = [];
+	let t = T0;
+	for (let i = 0; i < count; i++) {
+		if (i > 0 && i % perSession === 0) {t += 20 * MIN;}
+		const start = i % perSession === 0;
+		out.push(start
+			? { type: 'session_started', project: 'Client Co', timestamp: new Date(t).toISOString() }
+			: { type: 'file_saved', project: 'Client Co', fileName: `/Users/me/Client Co/f${i % 7}.ts`, language: 'typescript', timestamp: new Date(t).toISOString() });
+		t += 1000;
+	}
+	return out;
+}
+
+const ids = (s: State) => s.queue.map(e => e.clientEventId);
+
+test('uuidV5 matches the RFC test vector and yields valid v5 ids', () => {
+	assert.equal(uuidV5('6ba7b810-9dad-11d1-80b4-00c04fd430c8', 'www.example.com'), '2ed6657d-e927-568b-95e1-2665a8aea6a2');
+	const s = emptyState();
+	importLegacy(s, legacyQueue(50, 10), LEGACY);
+	assert.ok([...ids(s), ...Object.keys(s.sessions)].every(id => UUID.test(id)));
+});
+
+test('legacy sessions split at session_started markers and gaps over 15 min, order preserved', () => {
+	const at = (m: number) => new Date(T0 + m * MIN).toISOString();
+	const s = emptyState();
+	const n = importLegacy(s, [
+		{ type: 'session_started', timestamp: at(0) },
+		{ type: 'file_saved', fileName: 'a.ts', timestamp: at(5) },
+		{ type: 'file_saved', fileName: 'b.ts', timestamp: at(20) },            // exactly 15 min: same session
+		{ type: 'file_saved', fileName: 'c.ts', timestamp: at(19) },            // clock went back: same session
+		{ type: 'file_saved', fileName: 'd.ts', timestamp: at(35) },            // 16 min gap: new session
+		{ type: 'session_started', timestamp: at(36) },                         // marker: new session
+		{ type: 'file_saved', fileName: 'e.ts', timestamp: at(37) },
+	], LEGACY);
+	assert.equal(n, 7);
+	assert.deepEqual(s.queue.map(e => e.fileName ?? e.type), ['session_started', 'a.ts', 'b.ts', 'c.ts', 'd.ts', 'session_started', 'e.ts']);
+	const sids = [...new Set(s.queue.map(e => e.sid))];
+	assert.equal(sids.length, 3);
+	assert.deepEqual(s.queue.map(e => sids.indexOf(e.sid)), [0, 0, 0, 0, 1, 2, 2]);
+	const [a, b, c] = sids.map(id => s.sessions[id]);
+	assert.deepEqual([a.startedAt, a.lastActivityAt], [at(0), Date.parse(at(20))]);
+	assert.deepEqual([b.startedAt, b.lastActivityAt], [at(35), Date.parse(at(35))]);
+	assert.deepEqual([c.startedAt, c.lastActivityAt], [at(36), Date.parse(at(37))]);
+	assert.ok([a, b, c].every(m => m.ended));
+});
+
+test('legacy import is idempotent and ids never collide across files, positions or sessions', () => {
+	const q = legacyQueue(3000, 250);
+	const s = emptyState();
+	assert.equal(importLegacy(s, q, LEGACY), 3000);
+	const first = ids(s);
+	assert.equal(importLegacy(s, q, LEGACY), 0, 'second import adds nothing');
+	assert.equal(importLegacy(s, JSON.parse(JSON.stringify(q)), LEGACY), 0, 'a re-read copy adds nothing');
+	assert.deepEqual(ids(s), first);
+	assert.equal(Object.keys(s.sessions).length, 12);
+
+	const fresh = emptyState();
+	importLegacy(fresh, q, LEGACY);
+	assert.deepEqual(ids(fresh), first, 'a restarted window derives the same ids');
+	assert.deepEqual(Object.keys(fresh.sessions), Object.keys(s.sessions));
+
+	const other = emptyState();
+	importLegacy(other, q, 'codeography-2026-09-02.json');
+	const all = new Set([...first, ...ids(other), ...Object.keys(s.sessions), ...Object.keys(other.sessions)]);
+	assert.equal(all.size, 2 * (3000 + 12), 'another file name gets disjoint event and session ids');
+
+	const dup = { type: 'file_saved', fileName: 'x.ts', timestamp: new Date(T0).toISOString() };
+	const same = emptyState();
+	assert.equal(importLegacy(same, [dup, dup, dup], LEGACY), 3, 'identical events at different positions stay distinct');
+	assert.equal(new Set(ids(same)).size, 3);
+});
+
+test('legacy ids are derived only from fields that are sent', () => {
+	const s = emptyState();
+	importLegacy(s, [{ type: 'file_saved', fileName: '/a/.env', timestamp: new Date(T0).toISOString() }], LEGACY);
+	const t = emptyState();
+	importLegacy(t, [{ type: 'file_saved', fileName: '/b/.env.local', timestamp: new Date(T0).toISOString() }], LEGACY);
+	assert.deepEqual(ids(s), ids(t), 'a withheld secret name does not influence the id');
+});
+
+test('legacy import is all-or-nothing: a failure part-way leaves the state untouched', () => {
+	const q: unknown[] = legacyQueue(1000);
+	Object.defineProperty(q[999] as object, 'timestamp', { get() { throw new Error('unreadable'); } });
+	const s = emptyState();
+	assert.throws(() => importLegacy(s, q, LEGACY), /unreadable/);
+	assert.equal(s.queue.length, 0);
+	assert.deepEqual(s.sessions, {});
+});
+
+test('legacy import of 300k events: no stack overflow, order and ids preserved', () => {
+	const q = legacyQueue(300_000, 5000);
+	const s = emptyState();
+	const t = Date.now();
+	assert.equal(importLegacy(s, q, LEGACY), 300_000);
+	assert.ok(Date.now() - t < 20_000);
+	assert.equal(new Set(ids(s)).size, 300_000);
+	assert.equal(Object.keys(s.sessions).length, 60);
+	assert.ok(s.queue.every((e, i) => e.timestamp === q[i].timestamp), 'file order kept');
+	const one = emptyState();
+	assert.equal(importLegacy(one, legacyQueue(300_000).map(e => ({ ...e, type: 'file_saved' })), LEGACY), 300_000);
+	const [only] = Object.values(one.sessions);
+	assert.equal(only.startedAt, new Date(T0).toISOString());
+	assert.equal(only.lastActivityAt, T0 + 299_999 * 1000);
+});
+
+// A storage directory with the extension's on-disk layout. persist() writes this
+// window's state file; restart() is a new window recovering every state file.
+function storage(legacy: Record<string, unknown> = { [LEGACY]: legacyQueue(2000, 400) }) {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdg-legacy-'));
+	for (const [name, events] of Object.entries(legacy)) {fs.writeFileSync(path.join(dir, name), JSON.stringify(events, null, 2));}
+	let window = 0;
+	const snapshot = () => Object.fromEntries(fs.readdirSync(dir).filter(n => n.startsWith('codeography-')).map(n => [n, fs.readFileSync(path.join(dir, n), 'utf8')]));
+	const before = snapshot();
+	const io = (over: Partial<MigrationIo> = {}): MigrationIo => {
+		const file = path.join(dir, `state-${++window}.json`);
+		return {
+			persist: (st) => { writeFileDurable(file, JSON.stringify(st)); return true; },
+			writeFile: writeFileDurable,
+			...over,
+		};
+	};
+	const restart = () => {
+		const st = emptyState();
+		for (const n of fs.readdirSync(dir).filter(f => /^state-.*\.json$/.test(f))) {
+			mergeRecovered(st, JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')));
+		}
+		return st;
+	};
+	return {
+		dir, io, restart,
+		marker: () => fs.existsSync(path.join(dir, LEGACY_MARKER)),
+		legacyUntouched: () => assert.deepEqual(snapshot(), before, 'legacy files never modified or deleted'),
+		cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+	};
+}
+
+test('migration imports the newest legacy file once, keeps every legacy file, then skips it', () => {
+	const d = storage({ 'codeography-2026-08-31.json': legacyQueue(10), [LEGACY]: legacyQueue(2000, 400) });
+	const s = emptyState();
+	assert.deepEqual(migrateLegacy(d.dir, s, d.io()), { status: 'migrated', events: 2000 });
+	assert.equal(Object.keys(s.sessions).length, 5);
+	assert.ok(d.marker());
+	d.legacyUntouched();
+	const next = d.restart();
+	assert.equal(migrateLegacy(d.dir, next, d.io()).status, 'already-migrated');
+	assert.equal(next.queue.length, 2000);
+	d.legacyUntouched();
+	d.cleanup();
+});
+
+test('migration failure before persistence: no marker, next start imports the same ids', () => {
+	const d = storage();
+	const s = emptyState();
+	assert.equal(migrateLegacy(d.dir, s, d.io({ persist: () => false })).status, 'not-persisted');
+	assert.ok(!d.marker(), 'not marked migrated');
+	const next = d.restart();
+	assert.equal(next.queue.length, 0, 'nothing was persisted');
+	assert.equal(migrateLegacy(d.dir, next, d.io()).status, 'migrated');
+	assert.deepEqual(ids(next), ids(s));
+	d.legacyUntouched();
+	d.cleanup();
+});
+
+test('migration crash during persistence: half-written temp file is ignored, nothing orphaned', () => {
+	const d = storage();
+	const crash = new Error('process killed');
+	const s = emptyState();
+	assert.throws(() => migrateLegacy(d.dir, s, d.io({
+		persist: (st) => { fs.writeFileSync(path.join(d.dir, 'state-9.json.tmp'), JSON.stringify(st).slice(0, 1000)); throw crash; },
+	})), crash);
+	assert.ok(!d.marker());
+	const next = d.restart();
+	assert.equal(next.queue.length, 0);
+	assert.equal(migrateLegacy(d.dir, next, d.io()).status, 'migrated');
+	assert.equal(next.queue.length, 2000);
+	assert.deepEqual(ids(next), ids(s));
+	d.legacyUntouched();
+	d.cleanup();
+});
+
+test('migration crash after persistence, before the marker: recovery plus re-import queues nothing twice', () => {
+	const d = storage();
+	const s = emptyState();
+	const r = migrateLegacy(d.dir, s, d.io({ writeFile: () => { throw new Error('ENOSPC'); } }));
+	assert.equal(r.status, 'not-marked');
+	assert.ok(!d.marker());
+	const next = d.restart();                     // recovers the persisted state file
+	assert.equal(next.queue.length, 2000);
+	const sessions = Object.keys(next.sessions).sort();
+	assert.deepEqual(migrateLegacy(d.dir, next, d.io()), { status: 'migrated', events: 0 });
+	assert.equal(next.queue.length, 2000, 'no event queued twice');
+	assert.deepEqual(Object.keys(next.sessions).sort(), sessions, 'no logical session duplicated');
+	assert.ok(d.marker());
+	d.legacyUntouched();
+	d.cleanup();
+});
+
+test('unreadable legacy file or marker: left in place, nothing marked, import stays idempotent', () => {
+	const d = storage();
+	fs.writeFileSync(path.join(d.dir, 'codeography-2026-09-02.json'), '[{"type":"file_sa');   // 0.1.11 died mid-write
+	const s = emptyState();
+	assert.equal(migrateLegacy(d.dir, s, d.io()).status, 'unreadable');
+	assert.equal(s.queue.length, 0);
+	assert.ok(!d.marker());
+	fs.rmSync(path.join(d.dir, 'codeography-2026-09-02.json'));
+	assert.equal(migrateLegacy(d.dir, s, d.io()).status, 'migrated');
+	fs.writeFileSync(path.join(d.dir, LEGACY_MARKER), '{not json');
+	assert.deepEqual(migrateLegacy(d.dir, s, d.io()), { status: 'migrated', events: 0 }, 'corrupt marker: re-import adds nothing');
+	d.cleanup();
+});
+
+test('a legacy file that grew after migration adds only its new events', () => {
+	const q = legacyQueue(1000, 400);
+	const d = storage({ [LEGACY]: q });
+	const s = emptyState();
+	migrateLegacy(d.dir, s, d.io());
+	fs.writeFileSync(path.join(d.dir, LEGACY), JSON.stringify(legacyQueue(1200, 400)));
+	const last = (st: State) => Object.values(st.sessions).sort((a, b) => a.startedAt.localeCompare(b.startedAt)).at(-1)!;
+	const before = last(s).lastActivityAt;
+	assert.deepEqual(migrateLegacy(d.dir, s, d.io()), { status: 'migrated', events: 200 });
+	assert.equal(new Set(ids(s)).size, 1200);
+	assert.equal(last(s).lastActivityAt, before + 200 * 1000, 'the grown session covers its new events');
+	const fresh = emptyState();
+	importLegacy(fresh, legacyQueue(1200, 400), LEGACY);
+	assert.deepEqual(s.sessions, fresh.sessions, 'same sessions as a fresh import of the grown file');
+	d.cleanup();
+});
+
+// Mock backend: (session, clientEventId) dedupe and a 30-per-60 s limiter
+// without Retry-After, like production. Never touches the network.
+function mockServer(script: number[] = []) {
+	let now = Date.parse('2026-10-20T09:00:00Z');
+	let window: number[] = [];
+	const stored = new Map<string, Set<string>>();
+	const finalized = new Map<string, number>();
+	let accepted = 0, limited = 0, requests = 0;
+	const post = async (body: SyncBody) => {
+		requests++;
+		let status = script.length ? script.shift()! : 0;
+		if (!status) {
+			window = window.filter(t => now - t < MIN);
+			if (window.length >= 30) {status = 429;} else { window.push(now); status = 201; }
+		}
+		if (status === 429) {limited++;}
+		if (status === 201) {
+			const set = stored.get(body.clientSessionId) ?? new Set<string>();
+			for (const e of body.events) {set.add(e.clientEventId);}
+			stored.set(body.clientSessionId, set);
+			accepted += body.events.length;
+			if (body.finalize) {finalized.set(body.clientSessionId, (finalized.get(body.clientSessionId) ?? 0) + 1);}
+		}
+		now += 50;
+		return status;
+	};
+	const recorder = (state: State) => new Recorder(state, { now: () => now, uuid: () => 'unused', post, persist() {} });
+	const drain = async (rec: Recorder) => {
+		for (let tick = 0; tick < 1000; tick++) {
+			await rec.sync('key');
+			if (rec.state.queue.length === 0 && Object.keys(rec.state.sessions).length === 0) {return tick;}
+			now += 5 * MIN;                       // the extension's retry timer
+		}
+		throw new Error('did not drain');
+	};
+	const delivered = () => [...stored.values()].reduce((n, s) => n + s.size, 0);
+	return { recorder, drain, stored, finalized, delivered, stats: () => ({ accepted, limited, requests }) };
+}
+
+test('imported legacy backlog drains in chunks through 429s with no loss or duplicates', async () => {
+	for (const size of [999, 1000, 1001, 7000]) {
+		const srv = mockServer([429, 201, 429, 429]);
+		const s = emptyState();
+		importLegacy(s, legacyQueue(size, 2500), LEGACY);
+		const sessions = Object.keys(s.sessions).length;
+		await srv.drain(srv.recorder(s));
+		assert.equal(srv.delivered(), size, `${size}: every event stored once`);
+		assert.equal(srv.stats().accepted, size, `${size}: no acknowledged chunk resent`);
+		assert.equal(srv.finalized.size, sessions);
+		assert.ok([...srv.finalized.values()].every(n => n === 1), `${size}: each session finalized once`);
+	}
+});
+
+test('300k legacy backlog: drains through the limiter, survives a restart mid-drain without duplicates', async () => {
+	const d = storage({ [LEGACY]: legacyQueue(300_000, 5000) });
+	const srv = mockServer();
+	const s = emptyState();
+	assert.equal(migrateLegacy(d.dir, s, d.io()).status, 'migrated');
+	// First window: sends until rate limited, then is killed; its state is lost
+	// except for what was persisted at migration (the worst case).
+	const first = srv.recorder(s);
+	assert.equal(await first.sync('key'), 'retry');
+	const sentBeforeCrash = srv.stats().accepted;
+	assert.ok(sentBeforeCrash > 0 && sentBeforeCrash < 300_000);
+	fs.rmSync(path.join(d.dir, LEGACY_MARKER));     // and the marker never reached disk
+	const next = d.restart();
+	assert.equal(migrateLegacy(d.dir, next, d.io()).status, 'migrated');
+	assert.equal(next.queue.length, 300_000, 'resent events reuse their ids');
+	const ticks = await srv.drain(srv.recorder(next));
+	assert.equal(srv.delivered(), 300_000, 'backend stores every event exactly once');
+	assert.equal(srv.finalized.size, 60);
+	assert.ok(srv.stats().limited <= ticks + 1, 'at most one rate-limited request per retry tick');
+	d.legacyUntouched();
+	d.cleanup();
+});
+
+test('writeFileDurable replaces the file atomically and reports real I/O failures', () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdg-durable-'));
+	const file = path.join(dir, 'x.json');
+	writeFileDurable(file, 'one');
+	writeFileDurable(file, 'two');
+	assert.equal(fs.readFileSync(file, 'utf8'), 'two');
+	assert.deepEqual(fs.readdirSync(dir), ['x.json'], 'no temp file left behind');
+	assert.throws(() => writeFileDurable(path.join(dir, 'missing', 'y.json'), 'z'), /ENOENT/);
 	fs.rmSync(dir, { recursive: true, force: true });
 });
