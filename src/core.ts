@@ -353,6 +353,8 @@ function derivedId(key: string): string {
  * appending to the file) yields the same session and event ids: repeats are
  * skipped here and deduplicated by the backend. 0.1.11 only appended to its
  * queue until a sync emptied it, so its first event identifies the queue.
+ * This cannot dedupe against a 0.1.11 window that is still running and
+ * uploads the same events itself (it sends no event ids).
  * Nothing is added to `into` until the whole import has been built.
  */
 export function importLegacy(into: State, events: unknown): number {
@@ -381,6 +383,14 @@ export function importLegacy(into: State, events: unknown): number {
 	}
 	if (parsed.length === 0) {return 0;}
 
+	const known = into.sessions[sid];
+	const knownStart = known ? Date.parse(known.startedAt) : NaN;
+	const meta: SessionMeta = {
+		id: sid, ended: true, lastErrorCount: 0,
+		startedAt: new Date(knownStart < first ? knownStart : first).toISOString(),
+		lastActivityAt: known && known.lastActivityAt > last ? known.lastActivityAt : last,
+	};
+	// Everything that can throw is done; only plain assignments from here on.
 	const have = new Set(into.queue.map(e => e.clientEventId));
 	let added = 0;
 	for (const e of parsed) {
@@ -388,12 +398,7 @@ export function importLegacy(into: State, events: unknown): number {
 		into.queue.push(e);
 		added++;
 	}
-	const known = into.sessions[sid];
-	into.sessions[sid] = {
-		id: sid, ended: true, lastErrorCount: 0,
-		startedAt: new Date(known ? Math.min(first, Date.parse(known.startedAt)) : first).toISOString(),
-		lastActivityAt: known ? Math.max(last, known.lastActivityAt) : last,
-	};
+	into.sessions[sid] = meta;
 	return added;
 }
 

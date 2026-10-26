@@ -80,14 +80,18 @@ function refreshStatusBar() {
 
 // ---------- persistence (one file per window, recovered after a crash) ----------
 
-function writeState(state: State) {
-	if (!stateFile) {return;}
+// Returns false if the state could not be saved; callers that delete a source
+// file after saving must keep it in that case.
+function writeState(state: State): boolean {
+	if (!stateFile) {return false;}
 	try {
 		const tmp = `${stateFile}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify({ ...state, ownerPid: process.pid }));
 		fs.renameSync(tmp, stateFile);
+		return true;
 	} catch (error) {
 		console.error('Codeography: failed to persist queue:', error);
+		return false;
 	}
 }
 
@@ -133,8 +137,7 @@ function recoverOrphans(dir: string, into: State) {
 			const claimed = path.join(dir, `${STATE_PREFIX}claimed-${process.pid}-${name.slice(STATE_PREFIX.length)}`);
 			fs.renameSync(file, claimed);
 			mergeRecovered(into, JSON.parse(fs.readFileSync(claimed, 'utf8')));
-			writeState(into);
-			fs.unlinkSync(claimed);
+			if (writeState(into)) {fs.unlinkSync(claimed);} // else kept: still state-*.json, recovered next start
 		} catch (error) {
 			console.error('Codeography: could not recover', name, error);
 		}
@@ -153,19 +156,32 @@ function recoverOrphans(dir: string, into: State) {
 // before the import was saved is taken over on the next start; importLegacy's
 // derived ids make importing it again safe.
 const LEGACY = /^codeography-\d{4}-\d{2}-\d{2}\.json$/;
-const LEGACY_CLAIMED = /^legacy-claimed-(\d+)-(codeography-\d{4}-\d{2}-\d{2}\.json)$/;
+const LEGACY_CLAIMED = /^legacy-claimed-(\d+)-[0-9a-f]{8}-(codeography-\d{4}-\d{2}-\d{2}\.json)$/;
+// Unique per claim, so a claim can never replace another one that is still unimported.
+const claimName = (base: string) => `legacy-claimed-${process.pid}-${randomUUID().slice(0, 8)}-${base}`;
 
-function retainLegacy(dir: string, name: string) {
+// False if the file is still in place (it would later look like the newest).
+function retainLegacy(dir: string, name: string): boolean {
 	let target = path.join(dir, `legacy-retained-${name}`);
 	for (let i = 1; fs.existsSync(target); i++) {target = path.join(dir, `legacy-retained-${i}-${name}`);}
-	try { fs.renameSync(path.join(dir, name), target); } catch { /* another window moved it */ }
+	try {
+		fs.renameSync(path.join(dir, name), target);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return true;} // another window moved it
+		console.error('Codeography: could not set aside an older queue file; the import waits for the next start.', error);
+		return false;
+	}
 }
 
 function importClaimed(dir: string, claimed: string, into: State) {
 	const file = path.join(dir, claimed);
 	try {
 		const n = importLegacy(into, JSON.parse(fs.readFileSync(file, 'utf8')));
-		writeState(into);
+		if (!writeState(into)) {
+			console.error('Codeography: the imported queue could not be saved; the old queue file is kept and imported again on the next start.');
+			return;
+		}
 		fs.unlinkSync(file);
 		console.log(`Codeography: migrated ${n} unsent events from an older version.`);
 	} catch (error) {
@@ -180,8 +196,11 @@ function migrateLegacy(dir: string, into: State) {
 		if (!m) {continue;}
 		const owner = Number(m[1]);
 		if (owner !== process.pid && isAlive(owner)) {continue;}
-		const mine = `legacy-claimed-${process.pid}-${m[2]}`;
-		try { if (name !== mine) {fs.renameSync(path.join(dir, name), path.join(dir, mine));} } catch { continue; }
+		let mine = name;
+		if (owner !== process.pid) {
+			mine = claimName(m[2]);
+			try { fs.renameSync(path.join(dir, name), path.join(dir, mine)); } catch { continue; } // another window took it
+		}
 		importClaimed(dir, mine, into);
 	}
 
@@ -189,8 +208,8 @@ function migrateLegacy(dir: string, into: State) {
 	if (files.length === 0) {return;}
 	const newest = files[files.length - 1];
 	// Older days first: if this window dies midway, the newest is still newest.
-	for (const f of files.slice(0, -1)) {retainLegacy(dir, f);}
-	const claimed = `legacy-claimed-${process.pid}-${newest}`;
+	for (const f of files.slice(0, -1)) {if (!retainLegacy(dir, f)) {return;}}
+	const claimed = claimName(newest);
 	try { fs.renameSync(path.join(dir, newest), path.join(dir, claimed)); } catch { return; } // another window has it
 	importClaimed(dir, claimed, into);
 }
