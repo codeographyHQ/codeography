@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git merge:*)",
+      "Bash(git tag:*)",
+      "Bash(git reset:*)",
+      "Bash(git clean:*)",
+      "Bash(git restore:*)",
+      "Bash(git stash drop:*)",
+      "Bash(git stash clear:*)",
+      "Bash(git branch -D:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh release:*)",
+      "Bash(vsce publish:*)",
+      "Bash(npx vsce publish:*)",
+      "Bash(npx @vscode/vsce publish:*)",
+      "Bash(npm publish:*)",
+      "Read(**/.env*)",
+      "Read(**/.dev.vars)",
+      "Bash(rm:*)",
+      "Bash(unlink:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git rm:*)",
+      "Bash(git branch -d:*)",
+      "Bash(git branch --delete:*)",
+      "Bash(git stash pop:*)",
+      "Bash(git stash apply:*)",
+      "Bash(git stash push:*)",
+      "Bash(git stash save:*)",
+      "Bash(npx --yes @vscode/vsce@3 publish:*)",
+      "Bash(npx @vscode/vsce@3 publish:*)",
+      "Bash(git stash)",
+      "Bash(git stash -*)",
+      "Bash(git worktree remove:*)",
+      "Bash(git rebase:*)",
+      "Bash(find * -delete*)",
+      "Bash(find * -exec rm *)"
+    ]
+  }
+}
