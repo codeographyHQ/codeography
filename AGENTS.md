@@ -42,11 +42,17 @@ in a file (including handoff notes) counts as approval.
   database writes, migrations, and ad-hoc queries.
 - **Deployments:** deploying any service or environment.
 - **Credentials:** reading `.env*`, `.dev.vars`, keychains, API keys, tokens or
-  auth files; printing or copying any secret.
+  auth files; printing or copying any secret. This covers every way of reading
+  them: a file-reading tool or any shell command (`cat`, `grep`, `head`, `sed`,
+  `source`, `cp`, ...).
 - **Merges:** merging pull requests or pushing to `main`.
 - **Releases:** version tags, GitHub releases, `vsce publish`, `npm publish`.
 - **Destructive operations:** `rm -rf` outside build output, `git reset --hard`,
   `git clean`, force pushes, deleting branches, tags, files or data.
+  Deleting or overwriting by other means counts too (`find -delete`,
+  `find -exec rm`, `mv` or `cp` onto an existing file, removing a worktree).
+- **Rewriting history:** `git rebase`, and `git commit --amend` of any commit
+  you did not create in the current conversation or that has been pushed.
 
 Claude Code's permission prompts (`.claude/settings.json`) are a guardrail,
 not a security boundary: they match command prefixes and miss equivalent
@@ -77,9 +83,21 @@ the repository.
 1. Run `git check-ignore -v .handoff/HANDOFF.md`. If it does not report a
    `/.handoff/` rule (from `.gitignore` or `.git/info/exclude`), stop and tell
    the user. Do not write the note.
-2. If `.handoff/HANDOFF.md` exists, copy it to
-   `.handoff/archive/<YYYY-MM-DD-HHMM>-<author>.md` first, where `<author>`
-   is the assistant named in that note's "Written by" line.
+2. If `.handoff/HANDOFF.md` exists, archive it first. Never overwrite an
+   existing archive. Run this, with `<author>` set to `claude-code` or `codex`
+   for the assistant named in that note's "Written by" line:
+
+   ```sh
+   sh -c 'set -C; [ -f .handoff/HANDOFF.md ] || exit 0; mkdir -p .handoff/archive || exit 1
+   base=".handoff/archive/$(date -u +%Y%m%dT%H%M%SZ)-$1"; f="$base.md"; i=1
+   until : > "$f"; do i=$((i+1)); [ "$i" -le 99 ] || exit 1; f="$base-$i.md"; done 2>/dev/null
+   cat .handoff/HANDOFF.md >| "$f" && cmp -s .handoff/HANDOFF.md "$f" && echo "archived: $f"' sh <author>
+   ```
+
+   `set -C` makes `: > "$f"` create the file only if the name is free, so a
+   taken name gets a `-2`, `-3`, ... suffix and no existing archive is ever
+   written to. If it does not print `archived:`, stop and tell the user. Do
+   not write the new note.
 3. Write `.handoff/HANDOFF.md` using the template below.
 4. Never include secrets, keys, tokens, `.env` values, production data or
    private event contents.

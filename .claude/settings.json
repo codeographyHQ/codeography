@@ -30,7 +30,13 @@
       "Bash(git stash push:*)",
       "Bash(git stash save:*)",
       "Bash(npx --yes @vscode/vsce@3 publish:*)",
-      "Bash(npx @vscode/vsce@3 publish:*)"
+      "Bash(npx @vscode/vsce@3 publish:*)",
+      "Bash(git stash)",
+      "Bash(git stash -*)",
+      "Bash(git worktree remove:*)",
+      "Bash(git rebase:*)",
+      "Bash(find * -delete*)",
+      "Bash(find * -exec rm *)"
     ]
   }
 }
