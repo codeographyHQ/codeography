@@ -88,13 +88,18 @@ the repository.
    for the assistant named in that note's "Written by" line:
 
    ```sh
-   sh -c 'set -C; [ -f .handoff/HANDOFF.md ] || exit 0; mkdir -p .handoff/archive || exit 1
-   base=".handoff/archive/$(date -u +%Y%m%dT%H%M%SZ)-$1"; f="$base.md"; i=1
-   until : > "$f"; do i=$((i+1)); [ "$i" -le 99 ] || exit 1; f="$base-$i.md"; done 2>/dev/null
-   cat .handoff/HANDOFF.md >| "$f" && cmp -s .handoff/HANDOFF.md "$f" && echo "archived: $f"' sh <author>
+   sh -c 'case $1 in claude-code|codex) ;; *) exit 1 ;; esac
+   [ -f .handoff/HANDOFF.md ] || exit 0; mkdir -p .handoff/archive || exit 1
+   tmp=$(mktemp .handoff/archive/.tmp.XXXXXX) || exit 1; ok=
+   if cat .handoff/HANDOFF.md > "$tmp" && cmp -s .handoff/HANDOFF.md "$tmp"; then
+     base=".handoff/archive/$(date -u +%Y%m%dT%H%M%SZ)-$1"; f="$base.md"; i=1
+     until ln "$tmp" "$f" 2>/dev/null; do i=$((i+1)); [ "$i" -le 99 ] || break; f="$base-$i.md"; done
+     [ "$i" -le 99 ] && cmp -s "$tmp" "$f" && ok=1
+   fi; rm -f "$tmp"; [ "$ok" = 1 ] && echo "archived: $f"' sh <author>
    ```
 
-   `set -C` makes `: > "$f"` create the file only if the name is free, so a
+   The note is copied to a private temporary file and checked, then published
+   with `ln`, which fails if the name already exists (even as a symlink), so a
    taken name gets a `-2`, `-3`, ... suffix and no existing archive is ever
    written to. If it does not print `archived:`, stop and tell the user. Do
    not write the new note.
