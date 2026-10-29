@@ -2,6 +2,12 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
+## [0.1.13]
+
+- Documentation only: updated the Marketplace guide with setup instructions,
+  recorded signals, evidence-backed stories, privacy controls, and troubleshooting.
+- Extension runtime behavior and VS Code requirements are unchanged from 0.1.12.
+
 ## [0.1.12]
 
 - Fixed: an idle session could be finalized under the next session's id,

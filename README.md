@@ -116,9 +116,7 @@ Integration tests may download a VS Code test runtime. Packaging and publishing 
 
 ## Release notes
 
-The source manifest is **0.1.12**, and the repository has a **[v0.1.12 tag](https://github.com/codeographyHQ/codeography/tree/v0.1.12)**. See [CHANGELOG.md](CHANGELOG.md) for session-correctness, queue-recovery, and privacy changes. A source tag does not by itself verify the version currently served by the Marketplace. No GitHub Release was listed during the documentation review on **2026-10-28**.
-
-Keep existing VSIX packages, tags, and local recovery material until a separate release decision. Documentation changes do not publish an extension update.
+Version **0.1.13** updates this guide. Recording, synchronization, privacy behavior, and VS Code requirements are unchanged from **0.1.12**. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## License
 
