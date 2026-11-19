@@ -1,8 +1,8 @@
 {
   "name": "codeography",
   "displayName": "Codeography",
-  "description": "Turn your coding sessions into cinematic, narrative-driven stories. You code. Codeography tells the story.",
-  "version": "0.1.13",
+  "description": "Turns each coding session into a short episode, written from what actually happened. It never records your code.",
+  "version": "0.1.14",
   "engines": {
     "vscode": "^1.115.0"
   },
@@ -80,7 +80,7 @@
   },
   "homepage": "https://codeography.dev",
   "galleryBanner": {
-    "color": "#0C0B0A",
-    "theme": "dark"
+    "color": "#FFFFEB",
+    "theme": "light"
   }
 }

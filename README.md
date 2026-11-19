@@ -1,12 +1,33 @@
+<p align="center">
+  <img src="icon.png" alt="Codeography emblem" width="128" height="128">
+</p>
+
 # Codeography
 
-### You code. Codeography tells the story.
+### GitHub shows what you shipped. Codeography shows how you got there.
 
-Record the shape of a coding session without uploading its source code. Codeography captures editor activity, syncs it to your account, and gives you a session story with claims linked to recorded evidence. You decide which eligible sessions to publish.
+Codeography turns each coding session into a short episode, written from what actually happened in your editor. It never records your code.
 
-**[Install from the Marketplace](https://marketplace.visualstudio.com/items?itemName=codeographyHQ.codeography)** · [Open your dashboard](https://codeography.dev/dashboard) · [Privacy policy](https://codeography.dev/privacy)
+**[Install from the Marketplace](https://marketplace.visualstudio.com/items?itemName=codeographyHQ.codeography)** · [codeography.dev](https://codeography.dev) · [Privacy policy](https://codeography.dev/privacy)
 
-[Get started](#get-started) · [Capabilities](#what-gets-recorded) · [Privacy](#privacy-and-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
+[Get started](#get-started) · [What it records](#what-gets-recorded) · [Privacy](#privacy-and-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
+
+### What it records
+
+- **Saves**, plus the files you open
+- **Errors**, as changes in the editor's error count
+- **File changes** written to disk outside VS Code
+- **Commits**, without their messages
+
+It never records your code, keystrokes, clipboard, or error message text. The full list is in [What gets recorded](#what-gets-recorded).
+
+### Private by default
+
+Every session starts private. You choose which episodes to publish, and nothing appears on your public profile until you do. Details are in [Privacy and control](#privacy-and-control).
+
+### How to start
+
+Install the extension, sign in with GitHub at [codeography.dev](https://codeography.dev), connect VS Code from your dashboard, and code as usual. The steps are below.
 
 ---
 
@@ -116,7 +137,7 @@ Integration tests may download a VS Code test runtime. Packaging and publishing 
 
 ## Release notes
 
-Version **0.1.13** updates this guide. Recording, synchronization, privacy behavior, and VS Code requirements are unchanged from **0.1.12**. See [CHANGELOG.md](CHANGELOG.md) for the release history.
+Version **0.1.14** updates the Marketplace icon, description, and this guide to the new Codeography brand. Recording, synchronization, privacy behavior, and VS Code requirements are unchanged from **0.1.12**. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## License
 
