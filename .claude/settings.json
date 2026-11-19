@@ -38,5 +38,10 @@
       "Bash(find * -delete*)",
       "Bash(find * -exec rm *)"
     ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
   }
 }
