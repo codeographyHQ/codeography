@@ -2,6 +2,12 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
+## [0.1.14]
+
+- Listing only: new Codeography emblem as the extension icon, a light
+  cream gallery banner, a new description, and a rewritten top of the guide.
+- Extension runtime behavior and VS Code requirements are unchanged from 0.1.12.
+
 ## [0.1.13]
 
 - Documentation only: updated the Marketplace guide with setup instructions,
