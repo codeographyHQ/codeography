@@ -2,6 +2,22 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
+## [Unreleased]
+
+- When the server reports that a session was deleted from your account
+  (HTTP 410 with code `session_deleted`), the extension stops retrying it and
+  removes that session's queued events and local record. Other sessions and
+  their queued events are kept. If it was the session in progress, your next
+  activity starts a new session. Any other 410 is still treated as a refusal
+  that keeps the events queued.
+- Known limitation: if an older copy of the queue is recovered on the next
+  start (for example, the removal could not be saved before VS Code closed),
+  the deleted session is sent once more; the server refuses it again and
+  recreates nothing, and the extension then removes it.
+- Fixed: a failed sync request logged the raw network error, which could
+  contain the API key if the stored key had a newline or other control
+  character in it. The log now shows only a fixed message and an error code.
+
 ## [0.1.14]
 
 - Listing only: new Codeography emblem as the extension icon, a light
