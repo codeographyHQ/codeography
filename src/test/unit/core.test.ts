@@ -7,36 +7,43 @@ import {
 	Recorder, State, SyncBody, QueuedEvent, WriteDeduper, IDLE_GAP_MS, MAX_EVENTS_PER_SYNC,
 	emptyState, mergeRecovered, isSensitiveName, reportableName, isGeneratedPath, languageForPath,
 	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
-	uuidV5, migrateLegacy, writeFileDurable, LEGACY_MARKER, MigrationIo,
+	uuidV5, migrateLegacy, writeFileDurable, LEGACY_MARKER, MigrationIo, postSessions,
 } from '../../core';
 
 const MIN = 60_000;
 
-function harness(responses: number[] = []) {
+type Reply = number | 'session_deleted';
+
+function harness(responses: Reply[] = [], idPrefix = 'id') {
 	let t = Date.parse('2026-10-13T09:00:00Z');
 	let n = 0;
 	const posts: SyncBody[] = [];
 	const keysUsed: string[] = [];
 	const queue = [...responses];
 	let persisted = 0;
+	// The last state that reached "disk"; while diskFails, writes are lost.
+	let disk: State | null = null;
+	let diskFails = false;
 	let onPost: (() => void) | null = null;
 	const rec = new Recorder(emptyState(), {
 		now: () => t,
-		uuid: () => `id-${++n}`,
+		uuid: () => `${idPrefix}-${++n}`,
 		post: async (body, key) => {
 			posts.push(JSON.parse(JSON.stringify(body)));
 			keysUsed.push(key);
 			onPost?.();
 			return queue.length ? queue.shift()! : 201;
 		},
-		persist: () => { persisted++; },
+		persist: (st) => { persisted++; if (!diskFails) {disk = JSON.parse(JSON.stringify(st));} },
 	});
 	return {
 		rec, posts, keysUsed,
 		advance: (ms: number) => { t += ms; },
-		respond: (...s: number[]) => queue.push(...s),
+		respond: (...s: Reply[]) => queue.push(...s),
 		duringPost: (fn: () => void) => { onPost = fn; },
 		persistedCount: () => persisted,
+		disk: () => disk!,
+		failDisk: (fails: boolean) => { diskFails = fails; },
 	};
 }
 const save = (rec: Recorder, name = 'a.ts') => rec.track({ type: 'file_saved', fileName: name, language: 'typescript' });
@@ -334,6 +341,272 @@ test('other 4xx are refusals (no retry storm); 408/429 are retried', async () =>
 		save(h.rec);
 		assert.equal(await h.rec.sync('key'), 'retry', `status ${status}`);
 	}
+});
+
+// ---------- 410 session_deleted ----------
+
+// An ended session, then the current one; each has its own queued events.
+function twoSessions(h: ReturnType<typeof harness>) {
+	save(h.rec, 'old.ts');
+	const old = h.rec.state.current!;
+	h.rec.endCurrent();
+	h.advance(MIN);
+	save(h.rec, 'new.ts');
+	return { old, cur: h.rec.state.current! };
+}
+const idsOf = (s: State, sid: string) => s.queue.filter(e => e.sid === sid).map(e => e.clientEventId);
+
+test('410 session_deleted drops only that session; unrelated queued events are kept untouched', async () => {
+	const h = harness(['session_deleted', 503]);
+	const { old, cur } = twoSessions(h);
+	const curIds = idsOf(h.rec.state, cur);
+	assert.equal(await h.rec.sync('key'), 'retry', 'the other session\'s 503 is still a retry');
+	assert.equal(h.rec.state.sessions[old], undefined, 'deleted session record removed');
+	assert.deepEqual(idsOf(h.rec.state, old), [], 'deleted session events removed');
+	assert.deepEqual(idsOf(h.rec.state, cur), curIds, 'unrelated events kept, same ids');
+	assert.equal(h.rec.state.current, cur);
+	await h.rec.sync('key');
+	assert.ok(h.posts.slice(2).every(p => p.clientSessionId !== old), 'deleted session never sent again');
+	assert.deepEqual(h.rec.state.queue, [], 'unrelated session delivered on the retry');
+});
+
+test('410 session_deleted for the active session: next activity starts a new session, nothing else lost', async () => {
+	const h = harness([400, 'session_deleted']); // old refused (kept), current deleted
+	const { old, cur } = twoSessions(h);
+	h.rec.trackErrors(3);
+	const oldIds = idsOf(h.rec.state, old);
+	let posts = 0;
+	h.duringPost(() => { if (++posts === 2) {save(h.rec, 'during.ts');} }); // tracked while the 410 is in flight
+	assert.equal(await h.rec.sync('key'), 'rejected');
+	assert.equal(h.rec.state.current, null, 'deleted session is no longer current');
+	assert.equal(h.rec.state.sessions[cur], undefined);
+	assert.deepEqual(idsOf(h.rec.state, cur), [], 'its events, including the in-flight one, are dropped');
+	assert.deepEqual(idsOf(h.rec.state, old), oldIds, 'refused unrelated session keeps its events');
+	h.rec.trackErrors(4);                      // passive: must not crash or start a session
+	assert.equal(h.rec.state.current, null);
+	h.duringPost(() => {});
+	save(h.rec, 'after.ts');
+	const next = h.rec.state.current!;
+	assert.ok(next && next !== cur, 'a new session id, never the deleted one');
+	assert.deepEqual(h.rec.state.queue.filter(e => e.sid === next).map(e => e.type),
+		['session_started', 'error_count_changed', 'file_saved'], 'new session gets the usual baseline');
+	await h.rec.sync('key');
+	assert.ok(h.posts.slice(2).every(p => p.clientSessionId !== cur));
+	assert.ok(h.posts.some(p => p.clientSessionId === old && p.finalize), 'unrelated session still finalizes');
+});
+
+test('repeated 410s: a chunked deleted session costs one request, and replays are dropped again', async () => {
+	const h = harness(['session_deleted', 'session_deleted']);
+	for (let i = 0; i < MAX_EVENTS_PER_SYNC + 500; i++) {save(h.rec);}
+	h.rec.endCurrent();
+	h.advance(MIN);
+	save(h.rec, 'b.ts');
+	h.rec.endCurrent();
+	const stale: State = JSON.parse(JSON.stringify(h.rec.state)); // e.g. an orphan file recovered later
+	assert.equal(await h.rec.sync('key'), 'ok');
+	assert.equal(h.posts.length, 2, 'one request per deleted session, no further chunks');
+	assert.deepEqual(h.rec.state, { version: 1, current: null, sessions: {}, queue: [] });
+	await h.rec.sync('key');
+	assert.equal(h.posts.length, 2, 'nothing left to send');
+	mergeRecovered(h.rec.state, stale);
+	h.respond('session_deleted', 'session_deleted');
+	assert.equal(await h.rec.sync('key'), 'ok');
+	assert.equal(h.posts.length, 4);
+	assert.deepEqual(h.rec.state.queue, [], 'replayed deleted sessions are dropped again');
+	assert.deepEqual(h.rec.state.sessions, {});
+});
+
+test('410 session_deleted is persisted: a restart does not bring the session back', async () => {
+	const h = harness(['session_deleted', 503]);
+	const { old, cur } = twoSessions(h);
+	const curIds = idsOf(h.rec.state, cur);
+	await h.rec.sync('key');
+	const fresh = harness();
+	mergeRecovered(fresh.rec.state, h.disk());
+	assert.equal(fresh.rec.state.sessions[old], undefined);
+	assert.deepEqual(idsOf(fresh.rec.state, cur), curIds, 'unrelated events survive the restart');
+	await fresh.rec.sync('key');
+	assert.ok(fresh.posts.every(p => p.clientSessionId !== old));
+	assert.ok(fresh.posts.some(p => p.clientSessionId === cur && p.finalize));
+});
+
+test('410 session_deleted when persisting fails: memory is updated, a stale disk copy converges', async () => {
+	const h = harness(['session_deleted', 503]);
+	const { old, cur } = twoSessions(h);
+	const curIds = idsOf(h.rec.state, cur);
+	h.failDisk(true);
+	assert.equal(await h.rec.sync('key'), 'retry');
+	assert.equal(h.rec.state.sessions[old], undefined, 'dropped in memory despite the failed write');
+	assert.deepEqual(idsOf(h.rec.state, cur), curIds);
+	// Crash before any write lands: the next start recovers the stale copy.
+	const fresh = harness(['session_deleted']);
+	mergeRecovered(fresh.rec.state, h.disk());
+	assert.ok(fresh.rec.state.sessions[old], 'stale copy still has it');
+	assert.equal(await fresh.rec.sync('key'), 'ok');
+	assert.equal(fresh.posts[0].clientSessionId, old, 'resent once, refused as deleted again');
+	assert.equal(fresh.posts.filter(p => p.clientSessionId === old).length, 1);
+	assert.deepEqual(fresh.posts.find(p => p.clientSessionId === cur)!.events.map(e => e.clientEventId), curIds,
+		'unrelated events delivered once, same ids');
+	assert.deepEqual(fresh.rec.state.queue, []);
+	// Without a crash, the next successful write fixes the disk copy.
+	h.failDisk(false);
+	save(h.rec, 'later.ts');
+	assert.equal(h.disk().sessions[old], undefined);
+	assert.equal(h.disk().queue.filter(e => e.sid === old).length, 0);
+});
+
+// postSessions against a fake fetch that answers with real Response objects.
+// Never touches the network. Captures console output for the log checks.
+async function postWith(answer: () => Response | Promise<Response>) {
+	const calls: { url: string; init: RequestInit }[] = [];
+	const fetchFn = (async (url: string, init: RequestInit) => { calls.push({ url, init }); return answer(); }) as unknown as typeof fetch;
+	const body: SyncBody = {
+		project: 'vscode', clientSessionId: 'sid-private-123', finalize: false, startedAt: '2026-10-13T09:00:00.000Z', durationMinutes: 1,
+		events: [{ clientEventId: 'ev-1', type: 'file_saved', timestamp: '2026-10-13T09:00:00.000Z', fileName: 'secret-plan.ts', language: 'typescript' }],
+	};
+	const logs: string[] = [];
+	const orig = { log: console.log, warn: console.warn, error: console.error };
+	const capture = (...a: unknown[]) => { logs.push(a.map(x => x instanceof Error ? `${x.stack} ${String(x.cause)}` : typeof x === 'string' ? x : JSON.stringify(x)).join(' ')); };
+	console.log = console.warn = console.error = capture;
+	try {
+		const result = await postSessions(fetchFn, 'https://api.test/api/sessions', body, 'cdg_live_TOPSECRETKEY123456', 1000);
+		return { result, calls, logs };
+	} finally {
+		Object.assign(console, orig);
+	}
+}
+const reply = (status: number, text: string | null) => () => new Response(text, { status });
+const SENSITIVE = ['cdg_live_TOPSECRETKEY123456', 'sid-private-123', 'secret-plan.ts', 'ev-1', 'This session was deleted.'];
+
+test('postSessions: 410 session_deleted is recognized only from its exact code', async () => {
+	const deleted = await postWith(reply(410, JSON.stringify({ error: 'This session was deleted.', code: 'session_deleted' })));
+	assert.equal(deleted.result, 'session_deleted');
+	const { url, init } = deleted.calls[0];
+	assert.equal(url, 'https://api.test/api/sessions');
+	assert.equal(init.method, 'POST');
+	assert.deepEqual(init.headers, { 'Content-Type': 'application/json', 'Authorization': 'Bearer cdg_live_TOPSECRETKEY123456' });
+	assert.equal(JSON.parse(String(init.body)).clientSessionId, 'sid-private-123');
+	assert.ok(init.signal, 'request has a timeout');
+	for (const text of [
+		JSON.stringify({ error: 'Gone', code: 'other' }), JSON.stringify({ error: 'Gone' }), JSON.stringify({ code: 'SESSION_DELETED' }),
+		'"session_deleted"', '["session_deleted"]', 'null', '{"code":', 'session_deleted', '', null,
+	]) {
+		assert.equal((await postWith(reply(410, text))).result, 410, `410 body ${String(text)}`);
+	}
+	const broken = new ReadableStream({ start(c) { c.error(new Error('connection reset')); } });
+	assert.equal((await postWith(() => new Response(broken, { status: 410 }))).result, 410, 'unreadable 410 body');
+});
+
+test('postSessions: other statuses pass through and their bodies are ignored; network failures are 0', async () => {
+	const coded = JSON.stringify({ code: 'session_deleted' });
+	for (const status of [200, 201, 400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 503]) {
+		assert.equal((await postWith(reply(status, coded))).result, status, `status ${status}`);
+	}
+	assert.equal((await postWith(() => { throw new TypeError('fetch failed'); })).result, 0);
+	assert.equal((await postWith(() => Promise.reject(new DOMException('timed out', 'TimeoutError')))).result, 0);
+});
+
+test('postSessions: logs never contain the key, session id, file names or response body', async () => {
+	const runs = [];
+	for (const answer of [
+		reply(410, JSON.stringify({ error: 'This session was deleted.', code: 'session_deleted' })),
+		reply(410, '{"code":'),
+		reply(401, JSON.stringify({ error: 'This session was deleted.' })),
+		() => { throw new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND api.test'), { code: 'ENOTFOUND' }) }); },
+		() => Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
+		// What undici throws for a key with a control character: the message holds the key.
+		() => { throw new TypeError('Headers.append: "Bearer cdg_live_TOPSECRETKEY123456\n" is an invalid header value.'); },
+		() => { throw Object.assign(new Error('cdg_live_TOPSECRETKEY123456'), { name: 'cdg_live_TOPSECRETKEY123456', cause: { code: 'cdg_live_TOPSECRETKEY123456' } }); },
+		() => Promise.reject('cdg_live_TOPSECRETKEY123456'), // a non-Error rejection
+	]) {runs.push(await postWith(answer));} // one at a time: postWith swaps console
+	assert.deepEqual(runs[0].logs, ['Codeography: a session was deleted from your account; its local copy was removed.']);
+	assert.deepEqual(runs.slice(3).map(r => r.logs), [
+		['Codeography: sync request failed (ENOTFOUND).'],
+		['Codeography: sync request failed (TimeoutError).'],
+		['Codeography: sync request failed (TypeError).'],
+		['Codeography: sync request failed (unknown).'],
+		['Codeography: sync request failed (unknown).'],
+	]);
+	assert.ok(runs.slice(3).every(r => r.result === 0));
+	const all = runs.flatMap(r => r.logs).join('\n');
+	for (const s of SENSITIVE) {assert.ok(!all.includes(s), `log leaked ${s}`);}
+});
+
+test('postSessions with real fetch: a key with a newline fails locally and is not logged', async () => {
+	// An inner newline (an outer one is trimmed as whitespace) fails header
+	// validation before any DNS lookup or connection; .invalid never resolves anyway.
+	const key = 'cdg_live_SYNTHETIC\nKEY0000';
+	const logs: string[] = [];
+	const orig = console.error;
+	console.error = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+	try {
+		const body: SyncBody = { project: 'vscode', clientSessionId: 's', finalize: false, events: [], startedAt: '2026-10-13T09:00:00.000Z', durationMinutes: 0 };
+		assert.equal(await postSessions(fetch, 'https://host.invalid/api/sessions', body, key, 1000), 0);
+	} finally {
+		console.error = orig;
+	}
+	assert.deepEqual(logs, ['Codeography: sync request failed (TypeError).']);
+});
+
+test('410 session_deleted on real files: other windows\' files and unrelated sessions survive; a failed write converges', async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdg-410-'));
+	const mine = path.join(dir, 'state-a.json'), other = path.join(dir, 'state-b.json');
+	// Like extension.ts writeState: a failed write is logged and reported, never thrown.
+	const write = (file: string, st: State) => { try { writeFileDurable(file, JSON.stringify(st)); return true; } catch { return false; } };
+	const recover = () => {
+		const st = emptyState();
+		for (const n of fs.readdirSync(dir).filter(f => /^state-.*\.json$/.test(f))) {mergeRecovered(st, JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')));}
+		return st;
+	};
+	for (const failWrite of [false, true]) {
+		const otherWin = harness([], 'other');
+		save(otherWin.rec, 'other.ts');
+		write(other, otherWin.rec.state);
+		const otherBytes = fs.readFileSync(other, 'utf8');
+
+		const h = harness(['session_deleted', 503]);
+		const { old, cur } = twoSessions(h);
+		write(mine, h.rec.state);
+		const curIds = idsOf(h.rec.state, cur);
+		await h.rec.sync('key');
+		const ok = write(failWrite ? path.join(dir, 'missing', 'state-a.json') : mine, h.rec.state);
+		assert.equal(ok, !failWrite);
+		assert.equal(fs.readFileSync(other, 'utf8'), otherBytes, 'another window\'s file is never touched');
+
+		// Restart: a server that refuses only the deleted session.
+		const sent: string[] = [];
+		const fresh = new Recorder(recover(), {
+			now: () => Date.now(), uuid: () => 'unused', persist() {},
+			post: async (b) => { sent.push(b.clientSessionId); return b.clientSessionId === old ? 'session_deleted' : 201; },
+		});
+		assert.deepEqual(idsOf(fresh.state, cur), curIds, 'unrelated session from this window kept');
+		assert.equal(idsOf(fresh.state, otherWin.rec.state.current!).length, 2, 'other window\'s session kept');
+		assert.equal(Boolean(fresh.state.sessions[old]), failWrite, failWrite ? 'stale copy still has it' : 'deletion persisted');
+		assert.equal(await fresh.sync('key'), 'ok');
+		assert.equal(sent.filter(id => id === old).length, failWrite ? 1 : 0, 'a stale copy is resent at most once');
+		assert.deepEqual(fresh.state.queue, [], 'everything unrelated delivered');
+		assert.deepEqual(fresh.state.sessions, {});
+		fs.rmSync(mine, { force: true }); fs.rmSync(other, { force: true });
+	}
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('other statuses keep their behavior next to a 410 session_deleted; a plain 410 is still a refusal', async () => {
+	for (const [status, result] of [[401, 'unauthorized'], [408, 'retry'], [429, 'retry'], [0, 'retry'], [500, 'retry'], [400, 'rejected'], [410, 'rejected']] as const) {
+		const h = harness(['session_deleted', status]);
+		const { old, cur } = twoSessions(h);
+		const curIds = idsOf(h.rec.state, cur);
+		assert.equal(await h.rec.sync('key'), result, `status ${status}`);
+		assert.equal(h.rec.state.sessions[old], undefined, `status ${status}`);
+		assert.ok(h.rec.state.sessions[cur], `status ${status}: unrelated session kept`);
+		assert.deepEqual(idsOf(h.rec.state, cur), curIds, `status ${status}: unrelated events kept`);
+	}
+	const h = harness([410]);
+	save(h.rec);
+	const sid = h.rec.state.current!;
+	assert.equal(await h.rec.sync('key'), 'rejected');
+	assert.equal(h.rec.state.current, sid, 'a 410 without the code deletes nothing');
+	assert.equal(idsOf(h.rec.state, sid).length, 2);
 });
 
 test('shutdown after a long idle ends the session at its last activity (no late session_ended)', async () => {

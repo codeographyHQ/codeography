@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, migrateLegacy, writeFileDurable, KeyCache,
+	parseReflogCommit, readReflogSince, migrateLegacy, writeFileDurable, KeyCache, postSessions,
 } from './core';
 
 const API_URL = 'https://codeography-api.codeography.workers.dev';
@@ -162,20 +162,8 @@ function migrateLegacyQueue(dir: string, into: State) {
 
 // ---------- network ----------
 
-async function post(body: SyncBody, apiKey: string): Promise<number> {
-	try {
-		const response = await fetch(`${API_URL}/api/sessions`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-			body: JSON.stringify(body),
-			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-		});
-		return response.status;
-	} catch (error) {
-		console.error('Codeography: sync request failed:', error);
-		return 0;
-	}
-}
+const post = (body: SyncBody, apiKey: string) =>
+	postSessions(fetch, `${API_URL}/api/sessions`, body, apiKey, REQUEST_TIMEOUT_MS);
 
 async function syncNow() {
 	if (!recorder || !keys) {return;}
