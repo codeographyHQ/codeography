@@ -15,6 +15,16 @@
 				"kind": "build",
 				"isDefault": true
 			}
+		},
+		{
+			"label": "compile (staging API)",
+			"type": "shell",
+			"command": "npm run compile",
+			"options": {
+				"env": { "CODEOGRAPHY_API_URL": "https://codeography-api-staging.codeography.workers.dev" }
+			},
+			"problemMatcher": "$tsc",
+			"presentation": { "reveal": "silent" }
 		}
 	]
 }

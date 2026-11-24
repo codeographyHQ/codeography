@@ -7,8 +7,8 @@ import {
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
 	parseReflogCommit, readReflogSince, migrateLegacy, writeFileDurable, KeyCache, postSessions,
 } from './core';
+import { API_URL } from './apiUrl';
 
-const API_URL = 'https://codeography-api.codeography.workers.dev';
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const REQUEST_TIMEOUT_MS = 15_000;
 const SECRET_KEY = 'codeography.apiKey';
@@ -25,6 +25,10 @@ let flushPendingWrites: (() => void) | null = null;
 let keys: KeyCache | null = null; // read once per sync pass, not per request
 let closing = false;
 let syncProblem: Extract<SyncResult, 'unauthorized' | 'rejected'> | null = null;
+// Extension Development Host only: which API this build talks to (API_URL is
+// fixed at build time, see apiUrl.ts). Empty in installed builds.
+let devApiNote = '';
+const tip = (text: string) => text + devApiNote;
 
 // The status bar must tell the truth about state — not just that the
 // extension exists. A missing/invalid key looks identical to a working
@@ -36,7 +40,7 @@ function refreshStatusBar() {
 
 	if (keys?.unreadable) {
 		statusBar.text = '$(warning) Codeography · can\'t read API key';
-		statusBar.tooltip = 'Codeography could not read its API key from the system keychain, so nothing is syncing. Events stay queued.';
+		statusBar.tooltip = tip('Codeography could not read its API key from the system keychain, so nothing is syncing. Events stay queued.');
 		statusBar.backgroundColor = warn;
 		return;
 	}
@@ -44,28 +48,28 @@ function refreshStatusBar() {
 	// Until the keychain has answered once, the key is unknown, not missing.
 	if (!keys?.known) {
 		statusBar.text = '$(circle-outline) Codeography';
-		statusBar.tooltip = 'Codeography is starting';
+		statusBar.tooltip = tip('Codeography is starting');
 		statusBar.backgroundColor = undefined;
 		return;
 	}
 
 	if (!keys.value) {
 		statusBar.text = '$(warning) Codeography · set API key';
-		statusBar.tooltip = 'Codeography needs an API key. Click to set it.';
+		statusBar.tooltip = tip('Codeography needs an API key. Click to set it.');
 		statusBar.backgroundColor = warn;
 		return;
 	}
 
 	if (syncProblem === 'unauthorized') {
 		statusBar.text = '$(warning) Codeography · reconnect';
-		statusBar.tooltip = 'Your API key was rejected (it may have been revoked or regenerated), so syncing has stopped. Events stay queued on this computer. Click to set a new key.';
+		statusBar.tooltip = tip('Your API key was rejected (it may have been revoked or regenerated), so syncing has stopped. Events stay queued on this computer. Click to set a new key.');
 		statusBar.backgroundColor = warn;
 		return;
 	}
 
 	if (syncProblem === 'rejected') {
 		statusBar.text = '$(warning) Codeography · sync rejected';
-		statusBar.tooltip = 'The server rejected the upload. Your events are kept and will be retried; updating the extension may be needed.';
+		statusBar.tooltip = tip('The server rejected the upload. Your events are kept and will be retried; updating the extension may be needed.');
 		statusBar.backgroundColor = warn;
 		return;
 	}
@@ -74,7 +78,7 @@ function refreshStatusBar() {
 	statusBar.text = count > 0
 		? `$(circle-filled) Codeography · ${count} events`
 		: '$(circle-filled) Codeography';
-	statusBar.tooltip = 'Codeography is recording your session';
+	statusBar.tooltip = tip('Codeography is recording your session');
 	statusBar.backgroundColor = undefined;
 }
 
@@ -214,6 +218,9 @@ export function activate(context: vscode.ExtensionContext) {
 	recoverOrphans(storageDir, state);
 	migrateLegacyQueue(storageDir, state);
 
+	if (context.extensionMode === vscode.ExtensionMode.Development) {
+		devApiNote = `\n\nDevelopment host · API: ${new URL(API_URL).host}`;
+	}
 	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusBar.command = 'codeography.setApiKey';
 	statusBar.show();

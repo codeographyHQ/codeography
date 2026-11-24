@@ -35,13 +35,14 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "vscode:prepublish": "npm run compile && node scripts/check-package-api-url.mjs out",
+    "compile": "tsc -p ./ && node scripts/set-api-url.mjs",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
-    "test:unit": "npm run compile && node --test out/test/unit/core.test.js"
+    "test:unit": "npm run compile && node --test out/test/unit/core.test.js out/test/unit/apiUrl.test.js",
+    "check:api-url": "node scripts/check-package-api-url.mjs"
   },
   "devDependencies": {
     "@types/vscode": "^1.115.0",
