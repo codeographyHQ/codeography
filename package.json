@@ -41,7 +41,7 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
-    "test:unit": "npm run compile && node --test out/test/unit/core.test.js out/test/unit/apiUrl.test.js",
+    "test:unit": "npm run compile && node --test out/test/unit/core.test.js out/test/unit/apiUrl.test.js out/test/unit/wiring.test.js",
     "check:api-url": "node scripts/check-package-api-url.mjs"
   },
   "devDependencies": {

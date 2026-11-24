@@ -110,7 +110,9 @@ export class Recorder {
 		if (this.closed) { return; }
 		const now = this.deps.now();
 		this.endIfIdle(now);
-		const s = this.state.current ? this.state.sessions[this.state.current] : this.startSession(now);
+		// A current id without a record (never expected) must not stop recording:
+		// start a new session instead of throwing on every event.
+		const s = (this.state.current && this.state.sessions[this.state.current]) || this.startSession(now);
 		this.push(s, e, now);
 		s.lastActivityAt = now;
 		this.deps.persist(this.state);
@@ -154,11 +156,9 @@ export class Recorder {
 	shutdown(): void {
 		// A session that already went idle ended at its last activity, not now.
 		this.endIfIdle();
-		const id = this.state.current;
-		if (id) {
-			this.push(this.state.sessions[id], { type: 'session_ended' }, this.deps.now());
-			this.endCurrent();
-		}
+		const s = this.state.current ? this.state.sessions[this.state.current] : undefined;
+		if (s) {this.push(s, { type: 'session_ended' }, this.deps.now());}
+		this.endCurrent();
 		this.closed = true;
 	}
 

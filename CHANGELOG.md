@@ -22,6 +22,9 @@ All notable changes to the "codeography" extension will be documented in this fi
   their queued events are kept. If it was the session in progress, your next
   activity starts a new session. Any other 410 is still treated as a refusal
   that keeps the events queued.
+- Recording can no longer stop if the saved state names a current session
+  that has no record (for example a damaged state file): the next activity
+  starts a new session instead.
 - Known limitation: if an older copy of the queue is recovered on the next
   start (for example, the removal could not be saved before VS Code closed),
   the deleted session is sent once more; the server refuses it again and

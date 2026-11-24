@@ -448,6 +448,61 @@ test('410 session_deleted for the active session: next activity starts a new ses
 	assert.ok(h.posts.some(p => p.clientSessionId === old && p.finalize), 'unrelated session still finalizes');
 });
 
+test('staging regression: 410 for the active session, then new activity records and syncs under a new id', async () => {
+	const h = harness();
+	for (let i = 0; i < 4; i++) {save(h.rec, `a${i}.ts`);}
+	const deleted = h.rec.state.current!;
+	await h.rec.sync('key');                    // synced before the owner deletes it
+	save(h.rec, 'b.ts');
+	h.respond('session_deleted');
+	assert.equal(await h.rec.sync('key'), 'ok');
+	assert.equal(h.rec.state.current, null);
+	for (let round = 0; round < 3; round++) {   // keeps coding over several sync ticks
+		h.advance(3 * MIN);
+		save(h.rec, `c${round}.ts`);
+		const now = h.rec.state.current!;
+		assert.ok(now && now !== deleted, `round ${round}: recording under a new id`);
+		assert.ok(h.rec.state.queue.some(e => e.sid === now && e.fileName === `c${round}.ts`), `round ${round}: event queued`);
+		assert.equal(await h.rec.sync('key'), 'ok');
+		assert.deepEqual(h.rec.state.queue, [], `round ${round}: delivered`);
+	}
+	const fresh = h.posts.slice(2);
+	assert.equal(new Set(fresh.map(p => p.clientSessionId)).size, 1, 'one new session across the rounds');
+	assert.ok(fresh.every(p => p.clientSessionId !== deleted), 'the deleted id is never sent again');
+	assert.deepEqual(fresh.flatMap(p => p.events.map(e => e.fileName)).filter(Boolean), ['c0.ts', 'c1.ts', 'c2.ts']);
+	assert.deepEqual(fresh[0].events[0].type, 'session_started');
+});
+
+test('410 for an older, non-active session does not touch the active session', async () => {
+	const h = harness(['session_deleted']);
+	const { old, cur } = twoSessions(h);
+	const meta = JSON.parse(JSON.stringify(h.rec.state.sessions[cur]));
+	const curIds = idsOf(h.rec.state, cur);
+	assert.equal(await h.rec.sync('key'), 'ok');
+	assert.equal(h.rec.state.sessions[old], undefined);
+	assert.equal(h.rec.state.current, cur, 'still the active session');
+	assert.deepEqual(h.rec.state.sessions[cur], meta, 'its record is unchanged');
+	assert.equal(h.posts[1].clientSessionId, cur);
+	assert.deepEqual(h.posts[1].events.map(e => e.clientEventId), curIds, 'its events were delivered, not dropped');
+	save(h.rec, 'more.ts');
+	assert.equal(h.rec.state.current, cur, 'new activity continues the same session');
+	await h.rec.sync('key');
+	assert.equal(h.posts.at(-1)!.clientSessionId, cur);
+	assert.ok(h.posts.slice(1).every(p => p.clientSessionId !== old));
+});
+
+test('a current id with no session record (e.g. a damaged state file) never stops recording', async () => {
+	const h = harness();
+	h.rec.state.current = 'missing';
+	save(h.rec, 'a.ts');
+	const s = h.rec.state.current!;
+	assert.notEqual(s, 'missing');
+	assert.deepEqual(h.rec.state.queue.map(e => [e.sid, e.type]), [[s, 'session_started'], [s, 'file_saved']]);
+	h.rec.state.current = 'missing';
+	assert.doesNotThrow(() => h.rec.shutdown());
+	assert.equal(h.rec.state.current, null);
+});
+
 test('repeated 410s: a chunked deleted session costs one request, and replays are dropped again', async () => {
 	const h = harness(['session_deleted', 'session_deleted']);
 	for (let i = 0; i < MAX_EVENTS_PER_SYNC + 500; i++) {save(h.rec);}
