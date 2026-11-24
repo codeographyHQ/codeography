@@ -2,7 +2,7 @@
   "name": "codeography",
   "displayName": "Codeography",
   "description": "Turns each coding session into a short episode, written from what actually happened. It never records your code.",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "engines": {
     "vscode": "^1.115.0"
   },

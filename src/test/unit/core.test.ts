@@ -228,6 +228,59 @@ test('401 stops the sync and keeps the queue', async () => {
 	assert.equal(h.rec.state.queue.length, 2);
 });
 
+test('401 stops syncing: no further requests with that key, and nothing local is cleared', async () => {
+	const h = harness([401]);
+	save(h.rec, 'a.ts'); h.rec.endCurrent();
+	h.advance(MIN);
+	save(h.rec, 'b.ts'); h.rec.endCurrent();
+	h.advance(MIN);
+	save(h.rec, 'c.ts');
+	const before = JSON.parse(JSON.stringify(h.rec.state));
+	const persistsBefore = h.persistedCount();
+	assert.equal(await h.rec.sync('revoked'), 'unauthorized');
+	assert.equal(h.posts.length, 1, 'the pass stops at the first 401; other sessions are not tried');
+	assert.deepEqual(h.rec.state, before, 'every session, event and the current session are untouched');
+	assert.equal(h.persistedCount(), persistsBefore, 'nothing was rewritten');
+	for (let i = 0; i < 3; i++) {assert.equal(await h.rec.sync('revoked'), 'unauthorized');} // timer ticks
+	assert.equal(h.posts.length, 1, 'the rejected key is not sent again');
+	save(h.rec, 'still-recording.ts');
+	assert.equal(h.rec.state.queue.at(-1)!.fileName, 'still-recording.ts', 'recording continues while unauthorized');
+	assert.equal(await h.rec.sync('new-key'), 'ok', 'a new key resumes syncing');
+	assert.deepEqual(h.rec.state.queue, []);
+	assert.equal(new Set(h.posts.slice(1).map(p => p.clientSessionId)).size, 3, 'all three sessions delivered');
+});
+
+test('401: saving the same key again retries it; a restart retries it once', async () => {
+	const h = harness([401, 401]);
+	save(h.rec);
+	assert.equal(await h.rec.sync('k'), 'unauthorized');
+	assert.equal(await h.rec.sync('k'), 'unauthorized');
+	assert.equal(h.posts.length, 1);
+	h.rec.clearRejectedKey();                   // user saved the key again
+	assert.equal(await h.rec.sync('k'), 'unauthorized');
+	assert.equal(h.posts.length, 2, 'tried again after an explicit save');
+	const fresh = harness([401]);
+	mergeRecovered(fresh.rec.state, JSON.parse(JSON.stringify(h.rec.state)));
+	assert.equal(await fresh.rec.sync('k'), 'unauthorized');
+	assert.equal(await fresh.rec.sync('k'), 'unauthorized');
+	assert.equal(fresh.posts.length, 1, 'a new window tries the key once, then stops');
+	assert.equal(fresh.rec.state.queue.length, 2, 'queue kept across the restart');
+});
+
+test('410 then 401 in one pass: only the deleted session is dropped; the rest wait for a new key', async () => {
+	const h = harness(['session_deleted', 401]);
+	const { old, cur } = twoSessions(h);
+	h.advance(MIN);
+	const curIds = idsOf(h.rec.state, cur);
+	assert.equal(await h.rec.sync('revoked'), 'unauthorized');
+	assert.equal(h.rec.state.sessions[old], undefined);
+	assert.deepEqual(idsOf(h.rec.state, cur), curIds, 'other session untouched by the 401');
+	assert.equal(h.rec.state.current, cur);
+	assert.equal(await h.rec.sync('new-key'), 'ok');
+	assert.ok(h.posts.slice(2).every(p => p.clientSessionId !== old), 'deleted session never resent');
+	assert.deepEqual(h.posts.slice(2).flatMap(p => p.events.map(e => e.clientEventId)), curIds);
+});
+
 test('no API key: nothing is sent and nothing is lost', async () => {
 	const h = harness();
 	save(h.rec);

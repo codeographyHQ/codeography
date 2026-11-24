@@ -2,8 +2,15 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
-## [Unreleased]
+## [0.1.15] - unreleased
 
+- When the server rejects the API key (HTTP 401), syncing stops: the key is
+  not sent again until a new key is saved (or the same key is saved again, or
+  VS Code restarts). A warning asks you to set a new key, once per rejected
+  key, and the status bar shows **Reconnect**. Queued events and sessions are
+  never cleared on a 401, since it can mean the key was revoked or
+  regenerated; recording continues and everything syncs once a valid key is
+  set.
 - When the server reports that a session was deleted from your account
   (HTTP 410 with code `session_deleted`), the extension stops retrying it and
   removes that session's queued events and local record. Other sessions and

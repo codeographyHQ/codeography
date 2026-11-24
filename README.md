@@ -94,7 +94,7 @@ Old narrative text without evidence citations cannot be published under the curr
 |---|---|
 | **Set API key** | Connect from the dashboard or run **Codeography: Set API Key**. |
 | **Can't read API key** | VS Code could not read SecretStorage. Check the system keychain, reload VS Code, and reconnect if needed. Events stay queued. |
-| **Sync failed** | Check whether the key was revoked or expired. Generate a replacement in the dashboard. |
+| **Reconnect** | The server rejected the API key (it may have been revoked or regenerated), so syncing has stopped. Generate a new key in the dashboard and connect again. Events stay queued on this computer. |
 | **Sync rejected** | The server refused the payload. Update the extension and report the symptom without sharing the queue. Events are retained for retry. |
 | No story yet | Check the narrative status in the dashboard. Finalization and generation run asynchronously; a short or unrecognized-language session can be skipped. |
 | Offline or a request timed out | Pending events are retried on a later sync or recovered on the next start. Do not delete extension storage as a troubleshooting shortcut. |

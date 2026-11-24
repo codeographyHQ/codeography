@@ -57,8 +57,8 @@ function refreshStatusBar() {
 	}
 
 	if (syncProblem === 'unauthorized') {
-		statusBar.text = '$(warning) Codeography · sync failed';
-		statusBar.tooltip = 'Codeography could not sync. Check your API key.';
+		statusBar.text = '$(warning) Codeography · reconnect';
+		statusBar.tooltip = 'Your API key was rejected (it may have been revoked or regenerated), so syncing has stopped. Events stay queued on this computer. Click to set a new key.';
 		statusBar.backgroundColor = warn;
 		return;
 	}
@@ -172,6 +172,8 @@ async function syncNow() {
 	const result = await recorder.sync(key);
 	if (result === 'ok') {syncProblem = null;}
 	if (result === 'unauthorized') {
+		// Prompt once per rejected key, not on every timer tick; never while closing.
+		if (syncProblem !== 'unauthorized' && !closing) {promptReconnect();}
 		syncProblem = 'unauthorized';
 		console.error('Codeography: Invalid API key. Run "Codeography: Set API Key" to fix.');
 	}
@@ -183,7 +185,15 @@ async function syncNow() {
 	refreshStatusBar();
 }
 
+function promptReconnect() {
+	void vscode.window.showWarningMessage(
+		'Codeography: your API key was rejected. It may have been revoked or regenerated. Your events stay saved on this computer; set a new key to resume syncing.',
+		'Set API Key',
+	).then(choice => { if (choice) {void vscode.commands.executeCommand('codeography.setApiKey');} });
+}
+
 function keySaved() {
+	recorder?.clearRejectedKey();
 	syncProblem = null;
 	refreshStatusBar();
 	void syncNow();

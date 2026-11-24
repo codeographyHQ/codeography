@@ -89,7 +89,17 @@ export class Recorder {
 	private inFlight: Promise<SyncResult> | null = null;
 	private again = false;
 	private nextKey: string | undefined;
+	/**
+	 * The last key the server answered 401 for. It is not sent again: syncing
+	 * stops until the key changes. Memory only, so a restart tries it once more
+	 * (a 401 from a proxy or a server fault cannot stop syncing for good).
+	 * Nothing local is cleared: a 401 can mean a revoked or regenerated key.
+	 */
+	private rejectedKey: string | undefined;
 	private closed = false;
+
+	/** The user saved a key (possibly the same one): it may be tried again. */
+	clearRejectedKey(): void { this.rejectedKey = undefined; }
 	/** Last workspace error count seen, used as the baseline of a new session. */
 	private knownErrorCount: number | null = null;
 
@@ -172,7 +182,8 @@ export class Recorder {
 				this.again = false;
 				const used = this.nextKey;
 				if (!used) { result = 'no-key'; break; }   // key removed meanwhile
-				result = await this.drain(used);
+				result = used === this.rejectedKey ? 'unauthorized' : await this.drain(used);
+				if (result === 'unauthorized') {this.rejectedKey = used;}
 				// A different key gets its own pass whatever this pass returned, so
 				// a key fixed after a 401 is tried now, not at the next tick.
 				if (this.nextKey !== used || (this.again && result === 'ok')) {continue;}
