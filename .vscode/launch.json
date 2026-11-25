@@ -18,19 +18,21 @@
 			"preLaunchTask": "${defaultBuildTask}"
 		},
 		{
-			// Talks to the STAGING API. Own user-data folder, so this window has
-			// its own API key and never sends your real one to staging.
+			// Talks to the STAGING API in a SEPARATE VS Code process (the 1.115.0
+			// test build) with its own user data and extensions folders, so it has
+			// its own API key and never sees or overwrites your real one. Not an
+			// "extensionHost" launch: that opens the window inside your running
+			// VS Code, which ignores --user-data-dir (see scripts/run-staging.mjs).
+			// This attaches to the separate host's extension host.
 			"name": "Run (staging)",
-			"type": "extensionHost",
-			"request": "launch",
-			"args": [
-				"--extensionDevelopmentPath=${workspaceFolder}",
-				"--user-data-dir=${workspaceFolder}/.vscode-test/user-data-staging"
-			],
+			"type": "node",
+			"request": "attach",
+			"port": 9339,
+			"continueOnAttach": true,
 			"outFiles": [
 				"${workspaceFolder}/out/**/*.js"
 			],
-			"preLaunchTask": "compile (staging API)"
+			"preLaunchTask": "start staging host"
 		}
 	]
 }

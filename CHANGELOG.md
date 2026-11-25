@@ -7,8 +7,12 @@ All notable changes to the "codeography" extension will be documented in this fi
 - Development only: the API URL is fixed at build time (`CODEOGRAPHY_API_URL`,
   default production), never a setting, and packaging refuses any build that is
   not production. A **Run (staging)** launch configuration targets the staging
-  API in an isolated window; the development host's status bar tooltip names
-  the API host. No change for installed users.
+  API in a separate VS Code process with its own user data and extensions
+  folders (so it never shares the API key with your normal VS Code), opens an
+  empty window, and attaches the debugger. Any non-production build shows a
+  "Codeography STAGING build: API = <host>" warning when it starts, and the
+  development host's status bar tooltip names the API host. No change for
+  installed users.
 - When the server rejects the API key (HTTP 401), syncing stops: the key is
   not sent again until a new key is saved (or the same key is saved again, or
   VS Code restarts). A warning asks you to set a new key, once per rejected

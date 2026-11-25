@@ -25,6 +25,14 @@
 			},
 			"problemMatcher": "$tsc",
 			"presentation": { "reveal": "silent" }
+		},
+		{
+			"label": "start staging host",
+			"type": "shell",
+			"command": "node scripts/run-staging.mjs",
+			"dependsOn": "compile (staging API)",
+			"problemMatcher": [],
+			"presentation": { "reveal": "always" }
 		}
 	]
 }

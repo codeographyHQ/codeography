@@ -7,7 +7,7 @@ import {
 	Recorder, State, SyncBody, QueuedEvent, WriteDeduper, IDLE_GAP_MS, MAX_EVENTS_PER_SYNC,
 	emptyState, mergeRecovered, isSensitiveName, reportableName, isGeneratedPath, languageForPath,
 	parseReflogCommit, readReflogSince, importLegacy, KeyCache,
-	uuidV5, migrateLegacy, writeFileDurable, LEGACY_MARKER, MigrationIo, postSessions,
+	uuidV5, migrateLegacy, writeFileDurable, LEGACY_MARKER, MigrationIo, postSessions, stagingBanner,
 } from '../../core';
 
 const MIN = 60_000;
@@ -1319,6 +1319,15 @@ test('300k legacy backlog: drains through the limiter, survives a restart mid-dr
 	assert.ok(srv.stats().limited <= ticks + 1, 'at most one rate-limited request per retry tick');
 	d.legacyUntouched();
 	d.cleanup();
+});
+
+test('stagingBanner: shown for any API but production', () => {
+	assert.equal(stagingBanner('https://codeography-api.codeography.workers.dev'), undefined);
+	assert.equal(stagingBanner('https://codeography-api-staging.codeography.workers.dev'),
+		'Codeography STAGING build: API = codeography-api-staging.codeography.workers.dev');
+	assert.equal(stagingBanner('http://127.0.0.1:8787'), 'Codeography STAGING build: API = 127.0.0.1:8787');
+	assert.equal(stagingBanner('https://codeography-api.codeography.workers.dev.evil.test'),
+		'Codeography STAGING build: API = codeography-api.codeography.workers.dev.evil.test', 'host must match exactly');
 });
 
 test('writeFileDurable replaces the file atomically and reports real I/O failures', () => {

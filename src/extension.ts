@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import {
 	Recorder, State, SyncBody, SyncResult, WriteDeduper, WRITE_DEDUPE_MS,
 	emptyState, mergeRecovered, reportableName, isGeneratedPath, languageForPath,
-	parseReflogCommit, readReflogSince, migrateLegacy, writeFileDurable, KeyCache, postSessions,
+	parseReflogCommit, readReflogSince, migrateLegacy, writeFileDurable, KeyCache, postSessions, stagingBanner,
 } from './core';
 import { API_URL } from './apiUrl';
 
@@ -218,7 +218,10 @@ export function activate(context: vscode.ExtensionContext) {
 	recoverOrphans(storageDir, state);
 	migrateLegacyQueue(storageDir, state);
 
-	if (context.extensionMode === vscode.ExtensionMode.Development) {
+	// A non-production build says so as soon as it starts, before any key is used.
+	const banner = stagingBanner(API_URL);
+	if (banner) {void vscode.window.showWarningMessage(banner);}
+	if (banner || context.extensionMode === vscode.ExtensionMode.Development) {
 		devApiNote = `\n\nDevelopment host · API: ${new URL(API_URL).host}`;
 	}
 	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);

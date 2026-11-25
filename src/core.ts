@@ -294,6 +294,14 @@ export class Recorder {
 	}
 }
 
+const PRODUCTION_API_HOST = 'codeography-api.codeography.workers.dev';
+
+/** The warning to show when this build talks to any API other than production. */
+export function stagingBanner(apiUrl: string): string | undefined {
+	const host = new URL(apiUrl).host;
+	return host === PRODUCTION_API_HOST ? undefined : `Codeography STAGING build: API = ${host}`;
+}
+
 /**
  * Sends one sync request; resolves as Deps.post documents and never throws.
  * Only a 410 body is read, and only an explicit code "session_deleted" is

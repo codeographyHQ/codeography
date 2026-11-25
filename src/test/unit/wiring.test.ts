@@ -14,12 +14,13 @@ const saves: Handler[] = [];
 const secretChanges: Handler[] = [];
 const status = { text: '', tooltip: '', backgroundColor: undefined as unknown, command: '', show() {}, dispose() {} };
 const noop = () => ({ dispose() {} });
+const warnings: string[] = [];
 const vscodeStub = {
 	StatusBarAlignment: { Left: 1 }, ThemeColor: class { constructor(public id: string) {} },
 	ExtensionMode: { Production: 1, Development: 2, Test: 3 }, DiagnosticSeverity: { Error: 0 },
 	window: {
 		createStatusBarItem: () => status, registerUriHandler: noop,
-		showInformationMessage: async () => undefined, showWarningMessage: async () => undefined,
+		showInformationMessage: async () => undefined, showWarningMessage: async (m: string) => { warnings.push(m); return undefined; },
 		showErrorMessage: async () => undefined, showInputBox: async () => undefined,
 	},
 	commands: { registerCommand: noop, executeCommand: async () => undefined },
@@ -71,6 +72,8 @@ test('extension wiring: after 410 for the active session, new saves record and s
 		const sync = async () => { const n = posts.length; secretChanges.forEach(f => f({ key: 'codeography.apiKey' })); await until(() => posts.length > n, 'a sync'); await new Promise(r => setTimeout(r, 30)); };
 
 		await until(() => status.text === '$(circle-filled) Codeography', 'activation');
+		assert.deepEqual(warnings, [], 'a production build shows no STAGING banner');
+		assert.ok(!status.tooltip.includes('Development host'), 'no API note outside a development host');
 		for (let i = 0; i < 4; i++) {save(`a${i}.ts`);}
 		await until(() => status.text.endsWith('· 5 events'), 'status count');
 		await sync();
