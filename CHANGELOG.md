@@ -2,7 +2,7 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
-## [0.1.15] - unreleased
+## [0.1.15] - 2026-11-25
 
 - Development only: the API URL is fixed at build time (`CODEOGRAPHY_API_URL`,
   default production), never a setting, and packaging refuses any build that is
