@@ -137,7 +137,7 @@ Integration tests may download a VS Code test runtime. Packaging and publishing 
 
 ## Release notes
 
-Version **0.1.14** updates the Marketplace icon, description, and this guide to the new Codeography brand. Recording, synchronization, privacy behavior, and VS Code requirements are unchanged from **0.1.12**. See [CHANGELOG.md](CHANGELOG.md) for the release history.
+Version **0.1.15** removes a session's local copy when you delete it from your dashboard, and asks you to reconnect when the server rejects your API key, without clearing any local data. VS Code requirements are unchanged. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## License
 
