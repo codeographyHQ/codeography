@@ -4,6 +4,7 @@
 **
 !out/extension.js
 !out/core.js
+!out/apiUrl.js
 !package.json
 !README.md
 !CHANGELOG.md

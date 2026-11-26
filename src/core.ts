@@ -13,6 +13,9 @@ import { createHash } from 'crypto';
 // - Events leave the queue only after the backend acknowledged that exact
 //   request (2xx). A session the backend refuses stays queued and is skipped
 //   for that pass, so it cannot block other sessions.
+// - Exception: a session the backend reports deleted (410 session_deleted) is
+//   final. Its events and record are dropped locally and never resent; other
+//   sessions are untouched.
 // - Each event gets its clientEventId once, at creation; retries resend it.
 
 export const IDLE_GAP_MS = 15 * 60 * 1000;
@@ -63,8 +66,12 @@ export interface SyncBody {
 export interface Deps {
 	now(): number;
 	uuid(): string;
-	/** Resolves with the HTTP status, or 0 for network error / timeout. */
-	post(body: SyncBody, key: string): Promise<number>;
+	/**
+	 * Resolves with the HTTP status, 0 for network error / timeout, or
+	 * 'session_deleted' for a 410 whose body has code "session_deleted" (the
+	 * owner deleted this session; a 410 without that code is a plain status).
+	 */
+	post(body: SyncBody, key: string): Promise<number | 'session_deleted'>;
 	persist(state: State): void;
 }
 
@@ -82,7 +89,17 @@ export class Recorder {
 	private inFlight: Promise<SyncResult> | null = null;
 	private again = false;
 	private nextKey: string | undefined;
+	/**
+	 * The last key the server answered 401 for. It is not sent again: syncing
+	 * stops until the key changes. Memory only, so a restart tries it once more
+	 * (a 401 from a proxy or a server fault cannot stop syncing for good).
+	 * Nothing local is cleared: a 401 can mean a revoked or regenerated key.
+	 */
+	private rejectedKey: string | undefined;
 	private closed = false;
+
+	/** The user saved a key (possibly the same one): it may be tried again. */
+	clearRejectedKey(): void { this.rejectedKey = undefined; }
 	/** Last workspace error count seen, used as the baseline of a new session. */
 	private knownErrorCount: number | null = null;
 
@@ -93,7 +110,9 @@ export class Recorder {
 		if (this.closed) { return; }
 		const now = this.deps.now();
 		this.endIfIdle(now);
-		const s = this.state.current ? this.state.sessions[this.state.current] : this.startSession(now);
+		// A current id without a record (never expected) must not stop recording:
+		// start a new session instead of throwing on every event.
+		const s = (this.state.current && this.state.sessions[this.state.current]) || this.startSession(now);
 		this.push(s, e, now);
 		s.lastActivityAt = now;
 		this.deps.persist(this.state);
@@ -137,11 +156,9 @@ export class Recorder {
 	shutdown(): void {
 		// A session that already went idle ended at its last activity, not now.
 		this.endIfIdle();
-		const id = this.state.current;
-		if (id) {
-			this.push(this.state.sessions[id], { type: 'session_ended' }, this.deps.now());
-			this.endCurrent();
-		}
+		const s = this.state.current ? this.state.sessions[this.state.current] : undefined;
+		if (s) {this.push(s, { type: 'session_ended' }, this.deps.now());}
+		this.endCurrent();
 		this.closed = true;
 	}
 
@@ -165,7 +182,8 @@ export class Recorder {
 				this.again = false;
 				const used = this.nextKey;
 				if (!used) { result = 'no-key'; break; }   // key removed meanwhile
-				result = await this.drain(used);
+				result = used === this.rejectedKey ? 'unauthorized' : await this.drain(used);
+				if (result === 'unauthorized') {this.rejectedKey = used;}
 				// A different key gets its own pass whatever this pass returned, so
 				// a key fixed after a 401 is tried now, not at the next tick.
 				if (this.nextKey !== used || (this.again && result === 'ok')) {continue;}
@@ -190,6 +208,7 @@ export class Recorder {
 				if (this.nextKey !== key) {return 'ok';}
 				const status = await this.deps.post(this.body(meta, chunk, finalize), key);
 
+				if (status === 'session_deleted') { this.forget(meta.id); break; }
 				if (status >= 200 && status < 300) {
 					this.remove(chunk);
 					if (finalize) { delete this.state.sessions[meta.id]; this.deps.persist(this.state); break; }
@@ -225,6 +244,24 @@ export class Recorder {
 		};
 	}
 
+	/**
+	 * Drops a session the owner deleted: all of its queued events (including
+	 * any tracked while the request was in flight) and its record. If it was
+	 * the current session, the next activity starts a new session with a new
+	 * id; recording itself is not paused or resumed.
+	 *
+	 * Known limitation: no tombstone is kept. A stale copy of the session on
+	 * disk (a failed save then a crash, an orphan file, a legacy re-import) is
+	 * sent once more after a restart; the server refuses it with 410 again and
+	 * recreates nothing, and it is dropped here again.
+	 */
+	private forget(id: string): void {
+		this.state.queue = this.state.queue.filter(e => e.sid !== id);
+		delete this.state.sessions[id];
+		if (this.state.current === id) {this.state.current = null;}
+		this.deps.persist(this.state);
+	}
+
 	private remove(chunk: QueuedEvent[]): void {
 		const sent = new Set(chunk.map(e => e.clientEventId));
 		this.state.queue = this.state.queue.filter(e => !sent.has(e.clientEventId));
@@ -255,6 +292,56 @@ export class Recorder {
 	private push(s: SessionMeta, e: NewEvent, now: number): void {
 		this.state.queue.push({ ...e, clientEventId: this.deps.uuid(), sid: s.id, timestamp: new Date(now).toISOString() });
 	}
+}
+
+const PRODUCTION_API_HOST = 'codeography-api.codeography.workers.dev';
+
+/** The warning to show when this build talks to any API other than production. */
+export function stagingBanner(apiUrl: string): string | undefined {
+	const host = new URL(apiUrl).host;
+	return host === PRODUCTION_API_HOST ? undefined : `Codeography STAGING build: API = ${host}`;
+}
+
+/**
+ * Sends one sync request; resolves as Deps.post documents and never throws.
+ * Only a 410 body is read, and only an explicit code "session_deleted" is
+ * final: any other 410 (empty, malformed, other code) is a plain refusal.
+ * Logs never include the key, the request body or the response body.
+ */
+export async function postSessions(
+	fetchFn: typeof fetch, url: string, body: SyncBody, apiKey: string, timeoutMs: number,
+): Promise<number | 'session_deleted'> {
+	try {
+		const response = await fetchFn(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+			body: JSON.stringify(body),
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		if (response.status === 410) {
+			const reply: unknown = await response.json().catch(() => null);
+			if ((reply as { code?: unknown } | null)?.code === 'session_deleted') {
+				console.log('Codeography: a session was deleted from your account; its local copy was removed.');
+				return 'session_deleted';
+			}
+		}
+		return response.status;
+	} catch (error) {
+		// Never log the error itself: fetch echoes an invalid header value (an API
+		// key with a newline or NUL) in its message. Only a known identifier is kept.
+		console.error(`Codeography: sync request failed (${fetchErrorKind(error)}).`);
+		return 0;
+	}
+}
+
+const FETCH_ERROR_NAMES = new Set(['TimeoutError', 'AbortError', 'TypeError']);
+
+/** A fixed identifier for a fetch failure: a system/undici error code or error name. */
+function fetchErrorKind(error: unknown): string {
+	const e = error as { name?: unknown; cause?: { code?: unknown } } | null;
+	const code = e?.cause?.code;
+	if (typeof code === 'string' && /^(E[A-Z]{2,20}|UND_ERR_[A-Z_]{1,40})$/.test(code)) {return code;}
+	return typeof e?.name === 'string' && FETCH_ERROR_NAMES.has(e.name) ? e.name : 'unknown';
 }
 
 /**

@@ -2,6 +2,41 @@
 
 All notable changes to the "codeography" extension will be documented in this file.
 
+## [0.1.15] - unreleased
+
+- Development only: the API URL is fixed at build time (`CODEOGRAPHY_API_URL`,
+  default production), never a setting, and packaging refuses any build that is
+  not production. A **Run (staging)** launch configuration targets the staging
+  API in a separate VS Code process with its own user data and extensions
+  folders (so it never shares the API key with your normal VS Code), opens an
+  empty window, and attaches the debugger. Any non-production build shows a
+  "Codeography STAGING build: API = <host>" warning when it starts, and the
+  development host's status bar tooltip names the API host. No change for
+  installed users.
+- When the server rejects the API key (HTTP 401), syncing stops: the key is
+  not sent again until a new key is saved (or the same key is saved again, or
+  VS Code restarts). A warning asks you to set a new key, once per rejected
+  key, and the status bar shows **Reconnect**. Queued events and sessions are
+  never cleared on a 401, since it can mean the key was revoked or
+  regenerated; recording continues and everything syncs once a valid key is
+  set.
+- When the server reports that a session was deleted from your account
+  (HTTP 410 with code `session_deleted`), the extension stops retrying it and
+  removes that session's queued events and local record. Other sessions and
+  their queued events are kept. If it was the session in progress, your next
+  activity starts a new session. Any other 410 is still treated as a refusal
+  that keeps the events queued.
+- Recording can no longer stop if the saved state names a current session
+  that has no record (for example a damaged state file): the next activity
+  starts a new session instead.
+- Known limitation: if an older copy of the queue is recovered on the next
+  start (for example, the removal could not be saved before VS Code closed),
+  the deleted session is sent once more; the server refuses it again and
+  recreates nothing, and the extension then removes it.
+- Fixed: a failed sync request logged the raw network error, which could
+  contain the API key if the stored key had a newline or other control
+  character in it. The log now shows only a fixed message and an error code.
+
 ## [0.1.14]
 
 - Listing only: new Codeography emblem as the extension icon, a light
